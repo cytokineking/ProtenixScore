@@ -1,0 +1,13 @@
+NOTICE
+
+This project includes or depends on Protenix, which is licensed under the
+Apache License 2.0.
+
+Protenix original repository:
+https://github.com/bytedance/Protenix
+
+Pinned fork used by the install script:
+https://github.com/cytokineking/Protenix
+
+Protenix copyright:
+Copyright 2024 ByteDance and/or its affiliates.

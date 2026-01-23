@@ -36,6 +36,12 @@ weights/CCD data unless skipped. It also wires up `PROTENIX_CHECKPOINT_DIR` and
 `PROTENIX_DATA_ROOT_DIR` (conda activation or printed for manual export).
 See `./install_protenixscore.sh --help` for options.
 
+Protenix original repository:
+https://github.com/bytedance/Protenix
+
+Pinned fork used by the install script:
+https://github.com/cytokineking/Protenix
+
 ## Quickstart
 
 After installing (and activating the environment if you used conda), validate
