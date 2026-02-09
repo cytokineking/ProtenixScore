@@ -8,6 +8,9 @@ USE_EXISTING_ENV=0
 NO_CONDA=0
 FORK_URL="https://github.com/cytokineking/Protenix"
 FORK_BRANCH="main"
+# Pin the Protenix fork to a specific commit for reproducible installs.
+# Override with --commit <sha> (or pass an empty string to follow --branch).
+FORK_COMMIT="3dee563dd613e477e041aa2e47e7ea1089118b23"
 PROTENIX_DIR="${SCRIPT_DIR}/Protenix_fork"
 PROTENIXSCORE_DIR="${SCRIPT_DIR}"
 CHECKPOINT_DIR=""
@@ -27,6 +30,7 @@ Options:
   --no-conda                  Use current Python env (no conda)
   --fork URL                  Protenix fork URL (default: ${FORK_URL})
   --branch NAME               Protenix fork branch (default: ${FORK_BRANCH})
+  --commit SHA                Protenix fork commit to checkout (default: ${FORK_COMMIT})
   --protenix-dir PATH         Clone/install Protenix here (default: ${PROTENIX_DIR})
   --protenixscore-dir PATH    ProtenixScore dir (default: ${PROTENIXSCORE_DIR})
   --checkpoint-dir PATH       Checkpoint dir (default: <protenix-dir>/release_data/checkpoint)
@@ -52,6 +56,8 @@ while [[ $# -gt 0 ]]; do
       FORK_URL="$2"; shift 2 ;;
     --branch)
       FORK_BRANCH="$2"; shift 2 ;;
+    --commit)
+      FORK_COMMIT="$2"; shift 2 ;;
     --protenix-dir)
       PROTENIX_DIR="$2"; shift 2 ;;
     --protenixscore-dir)
@@ -117,8 +123,14 @@ if [[ -d "${PROTENIX_DIR}" ]]; then
     echo "Updating existing Protenix repo at ${PROTENIX_DIR}"
     git -C "${PROTENIX_DIR}" remote set-url origin "${FORK_URL}"
     git -C "${PROTENIX_DIR}" fetch origin
-    git -C "${PROTENIX_DIR}" checkout "${FORK_BRANCH}"
-    git -C "${PROTENIX_DIR}" pull --ff-only origin "${FORK_BRANCH}"
+    if [[ -n "${FORK_COMMIT}" ]]; then
+      echo "Checking out pinned Protenix commit: ${FORK_COMMIT}"
+      # Detached HEAD is expected when pinning.
+      git -C "${PROTENIX_DIR}" checkout --detach "${FORK_COMMIT}"
+    else
+      git -C "${PROTENIX_DIR}" checkout "${FORK_BRANCH}"
+      git -C "${PROTENIX_DIR}" pull --ff-only origin "${FORK_BRANCH}"
+    fi
   else
     echo "${PROTENIX_DIR} exists but is not a git repo. Remove it or choose --protenix-dir." >&2
     exit 1
@@ -126,6 +138,10 @@ if [[ -d "${PROTENIX_DIR}" ]]; then
 else
   echo "Cloning Protenix fork: ${FORK_URL} (branch ${FORK_BRANCH})"
   git clone --branch "${FORK_BRANCH}" "${FORK_URL}" "${PROTENIX_DIR}"
+  if [[ -n "${FORK_COMMIT}" ]]; then
+    echo "Checking out pinned Protenix commit: ${FORK_COMMIT}"
+    git -C "${PROTENIX_DIR}" checkout --detach "${FORK_COMMIT}"
+  fi
 fi
 
 should_install_protenix=1

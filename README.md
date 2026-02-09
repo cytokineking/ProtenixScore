@@ -36,6 +36,9 @@ weights/CCD data unless skipped. It also wires up `PROTENIX_CHECKPOINT_DIR` and
 `PROTENIX_DATA_ROOT_DIR` (conda activation or printed for manual export).
 See `./install_protenixscore.sh --help` for options.
 
+By default, `install_protenixscore.sh` pins the Protenix fork to a specific git commit for reproducibility.
+Override with `--commit <sha>` (or pass an empty commit string to follow `--branch`).
+
 Protenix original repository:
 https://github.com/bytedance/Protenix
 

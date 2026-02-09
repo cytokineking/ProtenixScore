@@ -8,6 +8,8 @@ __all__ = ["__version__"]
 __version__ = "0.1.0"
 
 _ROOT = Path(__file__).resolve().parents[1]
-_PROTENIX_DIR = _ROOT / "Protenix"
-if _PROTENIX_DIR.exists() and str(_PROTENIX_DIR) not in sys.path:
-    sys.path.insert(0, str(_PROTENIX_DIR))
+for _name in ("Protenix_fork", "Protenix"):
+    _protenix_dir = _ROOT / _name
+    if _protenix_dir.exists() and str(_protenix_dir) not in sys.path:
+        sys.path.insert(0, str(_protenix_dir))
+        break
