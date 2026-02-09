@@ -696,12 +696,13 @@ def _score_single(
         with open(json_path, "w") as f:
             json.dump(json_dict, f, indent=2)
 
-    dataset = InferenceDataset(
-        input_json_path=str(json_path),
-        dump_dir=str(output_dir),
-        use_msa=args.use_msa,
-        configs=runner.configs,
-    )
+    # Protenix v1+ expects InferenceDataset(configs) where configs carries
+    # input_json_path/dump_dir/use_msa. Older Protenix versions accepted these
+    # as constructor kwargs; keep things compatible by populating configs here.
+    runner.configs.input_json_path = str(json_path)
+    runner.configs.dump_dir = str(output_dir)
+    runner.configs.use_msa = args.use_msa
+    dataset = InferenceDataset(runner.configs)
 
     if len(dataset.inputs) != 1:
         raise ValueError("Expected a single sample in generated JSON")
