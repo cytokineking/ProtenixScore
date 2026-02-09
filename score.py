@@ -564,6 +564,154 @@ def _safe_round_values(data: dict, recursive: bool = True):
     return data
 
 
+def _calc_ipsae_d0_array(n0res_per_residue: torch.Tensor, pair_type: str = "protein") -> torch.Tensor:
+    """Vectorized d0 for ipSAE, following AF3Score's TM-score-like normalization.
+
+    n0res_per_residue is the count of interface partners (per residue in chain1)
+    passing the PAE cutoff.
+    """
+    if pair_type not in {"protein", "nucleic_acid"}:
+        pair_type = "protein"
+
+    # L is clamped at a minimum of 27.0 (AF3Score convention).
+    L = torch.clamp(n0res_per_residue.to(dtype=torch.float32), min=27.0)
+    min_value = 2.0 if pair_type == "nucleic_acid" else 1.0
+
+    # d0 = 1.24 * (L-15)^(1/3) - 1.8
+    d0 = 1.24 * torch.pow(L - 15.0, 1.0 / 3.0) - 1.8
+    return torch.clamp(d0, min=min_value)
+
+
+def _calculate_ipsae_for_chain_pair(
+    token_pair_pae: torch.Tensor,
+    token_asym_id: torch.Tensor,
+    chain_i: int,
+    chain_j: int,
+    pae_cutoff: float,
+    pair_type: str = "protein",
+) -> float:
+    """Compute directional ipSAE for chain_i -> chain_j.
+
+    This matches AF3Score's definition:
+    - valid pairs are those with PAE < pae_cutoff
+    - per-residue PTM-like score averaged over valid pairs
+    - final score is max over residues in chain_i
+    """
+    idx_i = torch.nonzero(token_asym_id == int(chain_i), as_tuple=False).squeeze(-1)
+    idx_j = torch.nonzero(token_asym_id == int(chain_j), as_tuple=False).squeeze(-1)
+    if idx_i.numel() == 0 or idx_j.numel() == 0:
+        return 0.0
+
+    sub_pae = token_pair_pae.index_select(0, idx_i).index_select(1, idx_j).to(dtype=torch.float32)
+    if sub_pae.numel() == 0:
+        return 0.0
+
+    valid_mask = sub_pae < float(pae_cutoff)
+    n0res = valid_mask.sum(dim=1)  # (N_i,)
+
+    d0 = _calc_ipsae_d0_array(n0res, pair_type=pair_type)  # (N_i,)
+    ptm_matrix = 1.0 / (1.0 + torch.square(sub_pae / d0[:, None]))
+
+    masked_sum = (ptm_matrix * valid_mask.to(dtype=ptm_matrix.dtype)).sum(dim=1)
+    denom = torch.clamp(n0res.to(dtype=torch.float32), min=1.0)
+    ipsae_per_residue = masked_sum / denom
+    score = float(ipsae_per_residue.max().item()) if ipsae_per_residue.numel() else 0.0
+    return score
+
+
+def _calculate_ipsae_metrics(
+    full_data: dict,
+    chain_id_map: Dict[str, Dict[str, str]],
+    pae_cutoff: float,
+    target_source_chains: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    """Calculate ipSAE metrics from Protenix full_data and chain mapping.
+
+    Returns a dict containing:
+    - ipsae_by_chain_pair: {"A_B": 0.83, "B_A": 0.81, ...} (source chain IDs)
+    - ipsae_max: max over all directional chain pairs
+    - ipsae_interface_max: if target_source_chains given, max over target<->binder directions
+    - ipsae_target_to_binder: max over target->binder
+    - ipsae_binder_to_target: max over binder->target
+    """
+    if not full_data:
+        return {}
+
+    token_asym_id = full_data.get("token_asym_id")
+    token_pair_pae = full_data.get("token_pair_pae")
+    if token_asym_id is None or token_pair_pae is None:
+        return {}
+
+    if not isinstance(token_asym_id, torch.Tensor):
+        token_asym_id = torch.as_tensor(token_asym_id)
+    if not isinstance(token_pair_pae, torch.Tensor):
+        token_pair_pae = torch.as_tensor(token_pair_pae)
+
+    # Optionally drop tokens that aren't associated with residue frames.
+    token_mask = full_data.get("token_has_frame")
+    if token_mask is not None:
+        if not isinstance(token_mask, torch.Tensor):
+            token_mask = torch.as_tensor(token_mask)
+        token_mask = token_mask.to(dtype=torch.bool)
+        token_asym_id = token_asym_id[token_mask]
+        token_pair_pae = token_pair_pae[token_mask][:, token_mask]
+
+    token_asym_id = token_asym_id.to(dtype=torch.long)
+    n_chain = len(chain_id_map.get("internal_order", []))
+    if n_chain <= 1:
+        return {}
+
+    internal_order = chain_id_map["internal_order"]
+    internal_to_source = chain_id_map["internal_to_source"]
+    idx_to_source = []
+    for idx in range(n_chain):
+        internal_id = internal_order[idx]
+        idx_to_source.append(internal_to_source.get(internal_id, str(internal_id)))
+
+    ipsae_by_pair: Dict[str, float] = {}
+    for i in range(n_chain):
+        for j in range(n_chain):
+            if i == j:
+                continue
+            src_i = idx_to_source[i]
+            src_j = idx_to_source[j]
+            key = f"{src_i}_{src_j}"
+            ipsae_by_pair[key] = _calculate_ipsae_for_chain_pair(
+                token_pair_pae=token_pair_pae,
+                token_asym_id=token_asym_id,
+                chain_i=i,
+                chain_j=j,
+                pae_cutoff=pae_cutoff,
+                pair_type="protein",
+            )
+
+    values = list(ipsae_by_pair.values())
+    ipsae_max = float(max(values)) if values else 0.0
+
+    result: Dict[str, object] = {
+        "ipsae_pae_cutoff": float(pae_cutoff),
+        "ipsae_by_chain_pair": ipsae_by_pair,
+        "ipsae_max": ipsae_max,
+    }
+
+    targets = set(target_source_chains or [])
+    if targets:
+        all_chains = set(idx_to_source)
+        binders = all_chains - targets
+        t2b_vals = [v for k, v in ipsae_by_pair.items() if k.split("_", 1)[0] in targets and k.split("_", 1)[1] in binders]
+        b2t_vals = [v for k, v in ipsae_by_pair.items() if k.split("_", 1)[0] in binders and k.split("_", 1)[1] in targets]
+        t2b = float(max(t2b_vals)) if t2b_vals else 0.0
+        b2t = float(max(b2t_vals)) if b2t_vals else 0.0
+        result["ipsae_target_to_binder"] = t2b
+        result["ipsae_binder_to_target"] = b2t
+        result["ipsae_interface_max"] = float(max(t2b, b2t))
+    else:
+        # If no target/binder split is provided, "interface" reduces to the global max.
+        result["ipsae_interface_max"] = ipsae_max
+
+    return result
+
+
 def _score_single(
     file_path: Path,
     runner,
@@ -778,7 +926,19 @@ def _score_single(
     end_model = time.perf_counter()
 
     summary = pred_dict["summary_confidence"][0]
-    full_data = pred_dict["full_data"][0] if args.write_full_confidence else None
+    full_data_raw = pred_dict["full_data"][0] if "full_data" in pred_dict else None
+
+    if getattr(args, "write_ipsae", False) and full_data_raw is not None:
+        target_chains = _parse_chain_list(args.target_chains) if getattr(args, "target_chains", None) else []
+        ipsae_metrics = _calculate_ipsae_metrics(
+            full_data=full_data_raw,
+            chain_id_map=chain_id_map,
+            pae_cutoff=float(getattr(args, "ipsae_pae_cutoff", 10.0)),
+            target_source_chains=target_chains,
+        )
+        summary.update(ipsae_metrics)
+
+    full_data = full_data_raw if args.write_full_confidence else None
 
     _write_chain_id_map(sample_out_dir / "chain_id_map.json", chain_id_map)
 
@@ -829,6 +989,9 @@ def _write_aggregate_csv(results: List[ScoreResult], csv_path: Path) -> None:
             "ptm": float(summary.get("ptm", 0.0)),
             "iptm": float(summary.get("iptm", 0.0)),
             "ranking_score": float(summary.get("ranking_score", 0.0)),
+            "ipsae_interface_max": float(summary.get("ipsae_interface_max", 0.0)),
+            "ipsae_target_to_binder": float(summary.get("ipsae_target_to_binder", 0.0)),
+            "ipsae_binder_to_target": float(summary.get("ipsae_binder_to_target", 0.0)),
         }
         rows.append(row)
 

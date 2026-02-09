@@ -166,6 +166,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     score.add_argument("--write_full_confidence", action="store_true", default=True)
     score.add_argument("--write_summary_confidence", action="store_true", default=True)
+    score.add_argument(
+        "--write_ipsae",
+        type=_str2bool,
+        default=True,
+        help="Compute and write ipSAE metrics into summary outputs (true/false). Default: true",
+    )
+    score.add_argument(
+        "--ipsae_pae_cutoff",
+        type=float,
+        default=10.0,
+        help="PAE cutoff in Angstroms for ipSAE (default: 10.0).",
+    )
     score.add_argument("--summary_format", default="json", choices=["json", "csv"])
     score.add_argument(
         "--aggregate_csv",
@@ -240,6 +252,8 @@ def _interactive_args() -> argparse.Namespace:
         max_atoms=None,
         write_full_confidence=True,
         write_summary_confidence=True,
+        write_ipsae=True,
+        ipsae_pae_cutoff=10.0,
         summary_format="json",
         aggregate_csv=None,
         overwrite=False,
