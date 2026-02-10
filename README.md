@@ -13,6 +13,7 @@ Key features
 - PDB or CIF input, with automatic PDB -> CIF conversion.
 - Per-structure outputs plus an aggregate CSV summary.
 - MSA features enabled by default (single-sequence MSA is injected if not provided).
+- ipSAE metrics (AF3Score-style) computed from Protenix token-pair PAE.
 
 ## Requirements
 
@@ -94,6 +95,33 @@ Notes:
 - `missing_atoms.json` is written when coordinates are missing and a fallback
   policy is used.
 
+### ipSAE (Interface Predicted Structural Alignment Error)
+
+ProtenixScore computes ipSAE using the same definition as AF3Score's `calculate_ipsae`
+(inspired by the `IPSAE` script family), but using Protenix's `token_pair_pae`
+from `full_confidence.json` instead of AlphaFold JSON outputs.
+
+Definition (directional, chain1 -> chain2):
+- Let `PAE(i,j)` be the token-pair PAE from chain1 token `i` to chain2 token `j`.
+- Keep only "valid" interface pairs where `PAE(i,j) < pae_cutoff` (default `10.0` Angstrom).
+- For each chain1 token `i`, compute `n0res(i) = count_j valid(i,j)`.
+- Compute a TM-score-like normalization per token:
+  `d0(i) = max(1.0, 1.24 * cbrt(max(27, n0res(i)) - 15) - 1.8)`.
+- Convert PAE to a PTM-like score:
+  `ptm(i,j) = 1 / (1 + (PAE(i,j) / d0(i))^2)`.
+- Per-token ipSAE is the mean `ptm(i,j)` over valid `j` (0 if no valid pairs).
+- Final ipSAE for the directional chain pair is `max_i per_token_ipSAE(i)`.
+
+Outputs:
+- `summary_confidence.json` includes:
+  - `ipsae_by_chain_pair`: map of directional chain-pair scores, keyed by source chain IDs (e.g. `A_B`, `B_A`).
+  - `ipsae_target_to_binder`, `ipsae_binder_to_target`, `ipsae_interface_max` when `--target_chains` is provided.
+- `summary.csv` includes `ipsae_interface_max`, `ipsae_target_to_binder`, `ipsae_binder_to_target`.
+
+Which ipSAE metric should you use?
+- For the common "many binders vs one target" setup (you pass `--target_chains A`),
+  the binder-focused score is `ipsae_binder_to_target` (direction: binder -> target).
+
 ## Common options
 
 - `--model_name` (default: `protenix_base_default_v0.5.0`)
@@ -116,6 +144,8 @@ Notes:
 - `--convert_pdb_to_cif` (always on for PDB input)
 - `--missing_atom_policy` (`reference|zero|error`, default: `reference`)
 - `--max_tokens` / `--max_atoms` (optional safety caps)
+- `--write_ipsae` (true/false, default: true)
+- `--ipsae_pae_cutoff` (default: 10.0 Angstrom)
 
 ## How it works (high level)
 
