@@ -10,10 +10,13 @@ from typing import List
 from protenixscore.cli import _str2bool
 from protenixscore.score import (
     _configure_device,
+    _load_msa_map_index,
     _load_runner,
     _parse_chain_sequence_overrides,
-    _prepare_intermediate_dirs,
     _sanitize_name,
+    _validate_msa_args,
+    _validate_msa_preflight,
+    _write_msa_resolution_summary,
     collect_input_files,
     _score_single,
 )
@@ -57,17 +60,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recursive", action="store_true", help="Recurse into subdirectories")
     parser.add_argument("--glob", default="*.pdb,*.cif", help="Comma-separated glob patterns")
 
-    parser.add_argument("--use_msa", type=_str2bool, default=True)
+    parser.add_argument("--use_msas", default="both", choices=["both", "target", "binder", "false"])
     parser.add_argument("--use_esm", type=_str2bool, default=False)
-    parser.add_argument("--msa_path", default=None)
+    parser.add_argument("--msa_map_csv", default=None)
+    parser.add_argument("--target_msa_shared_dir", default=None)
+    parser.add_argument("--binder_msa_shared_dir", default=None)
+    parser.add_argument("--msa_provider", default="mmseqs2", choices=["mmseqs2", "none"])
+    parser.add_argument("--msa_host_url", default="https://api.colabfold.com")
+    parser.add_argument("--msa_cache_mode", default="readwrite", choices=["readwrite", "read", "write", "none"])
+    parser.add_argument("--msa_missing_policy", default="error", choices=["error", "single"])
+    parser.add_argument("--validate_msa_inputs", type=_str2bool, default=True)
+    parser.add_argument("--msa_cache_dir", default=None)
     parser.add_argument("--chain_sequence", action="append", default=[])
     parser.add_argument("--target_chains", default=None)
     parser.add_argument("--target_chain_sequences", default=None)
-    parser.add_argument("--target_msa_path", default=None)
-    parser.add_argument("--binder_msa_mode", default="single", choices=["single", "none"])
-    parser.add_argument("--msa_cache_dir", default=None)
-    parser.add_argument("--msa_source", default="none", choices=["none", "colabfold"])
-    parser.add_argument("--msa_host", default="https://api.colabfold.com")
     parser.add_argument("--msa_use_env", type=_str2bool, default=True)
     parser.add_argument("--msa_use_filter", type=_str2bool, default=True)
     parser.add_argument("--msa_cache_refresh", type=_str2bool, default=False)
@@ -124,11 +130,27 @@ def main() -> None:
     args.failed_log = str(score_dir / "failed_records.txt")
     args.missing_atom_policy = "reference"
 
+    _validate_msa_args(args)
+    if args.msa_cache_mode != "none" and args.msa_cache_dir:
+        Path(args.msa_cache_dir).mkdir(parents=True, exist_ok=True)
+
+    chain_sequence_overrides = _parse_chain_sequence_overrides(args.chain_sequence)
+    map_index = _load_msa_map_index(args.msa_map_csv)
+    args._msa_map_index = map_index
+    if args.validate_msa_inputs:
+        _validate_msa_preflight(
+            args=args,
+            input_files=input_files,
+            map_index=map_index,
+            inter_dir=inter_dir,
+            chain_sequence_overrides=chain_sequence_overrides,
+        )
+
     _configure_device(args.device)
     runner = _load_runner(args)
 
-    chain_sequence_overrides = _parse_chain_sequence_overrides(args.chain_sequence)
     score_rows = []
+    score_results = []
     json_paths = []
 
     for file_path in input_files:
@@ -140,6 +162,7 @@ def main() -> None:
             inter_dir=inter_dir,
             chain_sequence_overrides=chain_sequence_overrides,
         )
+        score_results.append(result)
         score_rows.append(
             {
                 "sample": result.sample_name,
@@ -161,6 +184,8 @@ def main() -> None:
             f.write(",".join(header) + "\n")
             for row in score_rows:
                 f.write(",".join(str(row.get(col, "")) for col in header) + "\n")
+
+    _write_msa_resolution_summary(score_dir, score_results)
 
     score_total = sum(r.get("total_seconds") or 0.0 for r in score_rows)
     score_model_total = sum(r.get("model_seconds") or 0.0 for r in score_rows)

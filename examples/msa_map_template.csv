@@ -1,0 +1,4 @@
+sample_id,chain_id,role,msa_dir
+complex_0001,A,target,/abs/path/to/msa/complex_0001_A
+complex_0001,H,binder,/abs/path/to/msa/complex_0001_H
+complex_0001,L,binder,/abs/path/to/msa/complex_0001_L

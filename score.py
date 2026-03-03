@@ -3,13 +3,15 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 import traceback
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -36,9 +38,30 @@ class ScoreResult:
     summary: dict
     full_data: Optional[dict]
     output_dir: Path
+    msa_resolution: Optional[List[dict]] = None
     prep_seconds: Optional[float] = None
     model_seconds: Optional[float] = None
     total_seconds: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class MSAMapEntry:
+    row_number: int
+    sample_id: Optional[str]
+    chain_id: Optional[str]
+    role: Optional[str]
+    sequence_norm: Optional[str]
+    msa_dir: Optional[Path]
+    non_pairing_path: Optional[Path]
+    pairing_path: Optional[Path]
+
+
+@dataclass
+class MSAMapIndex:
+    sample_chain: Dict[Tuple[str, str], MSAMapEntry]
+    role_sequence: Dict[Tuple[str, str], MSAMapEntry]
+    sequence_only: Dict[str, MSAMapEntry]
+    entries: List[MSAMapEntry]
 
 
 def _ensure_dir(path: Path) -> None:
@@ -287,16 +310,753 @@ def _hash_sequence(sequence: str) -> str:
     return hashlib.sha256(sequence.encode("utf-8")).hexdigest()
 
 
-def _set_precomputed_msa(protein: dict, msa_dir: Path, sample_name: str, chain_id: str) -> None:
+def _normalize_sequence(sequence: str) -> str:
+    normalized = []
+    for ch in sequence.upper():
+        if ch.isspace() or ch in {"-", "."}:
+            continue
+        normalized.append(ch)
+    return "".join(normalized)
+
+
+def _is_role_enabled(use_msas: str, role: str) -> bool:
+    if use_msas == "both":
+        return True
+    if use_msas == "target":
+        return role == "target"
+    if use_msas == "binder":
+        return role == "binder"
+    return False
+
+
+def _read_csv_row_value(row: dict, key: str) -> str:
+    value = row.get(key, "")
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _resolve_csv_path(path_value: str, csv_path: Path) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return (csv_path.parent / path).resolve()
+
+
+def _validate_msa_dir_exists(
+    msa_dir: Path,
+    *,
+    sample_name: str,
+    chain_id: str,
+    source_label: str,
+) -> List[str]:
     non_pairing = msa_dir / "non_pairing.a3m"
     if not non_pairing.exists():
         raise FileNotFoundError(
-            f"{sample_name}: missing MSA file {non_pairing} for chain {chain_id}"
+            f"{sample_name}: missing MSA file {non_pairing} for chain {chain_id} ({source_label})"
         )
+    warnings: List[str] = []
+    pairing = msa_dir / "pairing.a3m"
+    if not pairing.exists():
+        warnings.append(f"missing pairing.a3m in {msa_dir}")
+    return warnings
+
+
+def _load_msa_map_index(msa_map_csv: Optional[str]) -> MSAMapIndex:
+    if not msa_map_csv:
+        return MSAMapIndex(sample_chain={}, role_sequence={}, sequence_only={}, entries=[])
+
+    path = Path(msa_map_csv)
+    if not path.exists():
+        raise FileNotFoundError(f"--msa_map_csv file not found: {path}")
+
+    sample_chain: Dict[Tuple[str, str], MSAMapEntry] = {}
+    role_sequence: Dict[Tuple[str, str], MSAMapEntry] = {}
+    sequence_only: Dict[str, MSAMapEntry] = {}
+    entries: List[MSAMapEntry] = []
+
+    with open(path, "r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"--msa_map_csv has no header row: {path}")
+        for row_number, row in enumerate(reader, start=2):
+            sample_raw = _read_csv_row_value(row, "sample_id") or _read_csv_row_value(row, "sample")
+            sample_id = _sanitize_name(sample_raw) if sample_raw else None
+            chain_id = _read_csv_row_value(row, "chain_id") or None
+
+            role_raw = _read_csv_row_value(row, "role").lower()
+            role: Optional[str] = role_raw or None
+            if role is not None and role not in {"target", "binder"}:
+                raise ValueError(
+                    f"--msa_map_csv row {row_number}: role must be target or binder, got {role_raw!r}"
+                )
+
+            seq_raw = _read_csv_row_value(row, "sequence")
+            sequence_norm = _normalize_sequence(seq_raw) if seq_raw else None
+
+            has_sample_chain = bool(sample_id and chain_id)
+            has_sequence = bool(sequence_norm)
+            if not (has_sample_chain or has_sequence):
+                raise ValueError(
+                    f"--msa_map_csv row {row_number}: provide sample_id+chain_id and/or sequence"
+                )
+
+            msa_dir_raw = _read_csv_row_value(row, "msa_dir")
+            non_pairing_raw = _read_csv_row_value(row, "non_pairing_path")
+            pairing_raw = _read_csv_row_value(row, "pairing_path")
+
+            if msa_dir_raw and (non_pairing_raw or pairing_raw):
+                raise ValueError(
+                    f"--msa_map_csv row {row_number}: use either msa_dir OR pairing_path+non_pairing_path"
+                )
+            if not msa_dir_raw and not (non_pairing_raw and pairing_raw):
+                raise ValueError(
+                    f"--msa_map_csv row {row_number}: missing MSA location; provide msa_dir or pairing_path+non_pairing_path"
+                )
+
+            entry = MSAMapEntry(
+                row_number=row_number,
+                sample_id=sample_id,
+                chain_id=chain_id,
+                role=role,
+                sequence_norm=sequence_norm,
+                msa_dir=_resolve_csv_path(msa_dir_raw, path) if msa_dir_raw else None,
+                non_pairing_path=_resolve_csv_path(non_pairing_raw, path) if non_pairing_raw else None,
+                pairing_path=_resolve_csv_path(pairing_raw, path) if pairing_raw else None,
+            )
+            entries.append(entry)
+
+            if has_sample_chain:
+                sample_key = (sample_id, chain_id)
+                if sample_key in sample_chain:
+                    prev = sample_chain[sample_key]
+                    raise ValueError(
+                        f"--msa_map_csv duplicate sample_id+chain_id key {sample_key} "
+                        f"(rows {prev.row_number} and {row_number})"
+                    )
+                sample_chain[sample_key] = entry
+
+            if has_sequence and role is not None:
+                role_key = (role, sequence_norm)
+                if role_key in role_sequence:
+                    prev = role_sequence[role_key]
+                    raise ValueError(
+                        f"--msa_map_csv duplicate role+sequence key {role_key} "
+                        f"(rows {prev.row_number} and {row_number})"
+                    )
+                role_sequence[role_key] = entry
+
+            if has_sequence and role is None:
+                if sequence_norm in sequence_only:
+                    prev = sequence_only[sequence_norm]
+                    raise ValueError(
+                        f"--msa_map_csv duplicate sequence key {sequence_norm[:16]}... "
+                        f"(rows {prev.row_number} and {row_number})"
+                    )
+                sequence_only[sequence_norm] = entry
+
+    return MSAMapIndex(
+        sample_chain=sample_chain,
+        role_sequence=role_sequence,
+        sequence_only=sequence_only,
+        entries=entries,
+    )
+
+
+def _resolve_map_entry(
+    map_index: MSAMapIndex,
+    *,
+    sample_id: str,
+    chain_id: str,
+    role: str,
+    sequence_norm: str,
+) -> Tuple[Optional[MSAMapEntry], Optional[str]]:
+    if not map_index.entries:
+        return None, None
+
+    sample_key = (sample_id, chain_id)
+    if sample_key in map_index.sample_chain:
+        return map_index.sample_chain[sample_key], "sample_chain"
+
+    if sequence_norm:
+        role_key = (role, sequence_norm)
+        if role_key in map_index.role_sequence:
+            return map_index.role_sequence[role_key], "role_sequence"
+        if sequence_norm in map_index.sequence_only:
+            return map_index.sequence_only[sequence_norm], "sequence"
+
+    return None, None
+
+
+def _remove_tree(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_lock_pid(lock_path: Path) -> Optional[int]:
+    try:
+        text = lock_path.read_text()
+    except OSError:
+        return None
+    for token in text.split():
+        if token.startswith("pid="):
+            value = token.split("=", 1)[1].strip()
+            if value.isdigit():
+                return int(value)
+    return None
+
+
+@contextmanager
+def _cache_lock(lock_path: Path, timeout_sec: float = 300.0, stale_sec: float = 1800.0) -> Iterable[None]:
+    _ensure_dir(lock_path.parent)
+    start = time.time()
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(f"pid={os.getpid()} ts={time.time()}\n")
+            break
+        except FileExistsError:
+            try:
+                stat = lock_path.stat()
+                age = time.time() - stat.st_mtime
+            except OSError:
+                age = 0.0
+
+            lock_pid = _read_lock_pid(lock_path)
+            if lock_pid is not None and not _pid_is_running(lock_pid):
+                logger.warning("Removing stale cache lock (dead pid=%s): %s", lock_pid, lock_path)
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            if lock_pid is None and age > stale_sec:
+                logger.warning("Removing stale cache lock (old/unowned): %s", lock_path)
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+
+            if time.time() - start > timeout_sec:
+                raise TimeoutError(f"Timed out waiting for cache lock: {lock_path}")
+            time.sleep(0.2)
+    try:
+        yield
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _build_cache_key_context(sequence_norm: str, role: str, args) -> Tuple[str, dict]:
+    context = {
+        "version": "msa_cache_v1",
+        "normalized_sequence": sequence_norm,
+        "role": role,
+        "provider": args.msa_provider,
+        "host_url": args.msa_host_url,
+        "pairing_strategy": "colabfold_single_query",
+    }
+    payload = json.dumps(context, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest(), context
+
+
+def _cache_entry_ready(msa_dir: Path) -> bool:
+    return (msa_dir / "non_pairing.a3m").exists() and (msa_dir / "manifest.json").exists()
+
+
+def _write_cache_manifest(msa_dir: Path, context: dict, sequence_norm: str) -> None:
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "sequence_sha256": _hash_sequence(sequence_norm),
+        "provider": context.get("provider"),
+        "host_url": context.get("host_url"),
+        "role": context.get("role"),
+        "cache_context": context,
+    }
+    with open(msa_dir / "manifest.json", "w") as handle:
+        json.dump(manifest, handle, indent=2)
+
+
+def _materialize_map_entry_dir(
+    entry: MSAMapEntry,
+    sample_msa_root: Path,
+) -> Path:
+    if entry.msa_dir is not None:
+        return entry.msa_dir
+
+    if entry.non_pairing_path is None or entry.pairing_path is None:
+        raise ValueError(f"MSA map row {entry.row_number} is missing explicit MSA file paths")
+
+    key_payload = f"{entry.non_pairing_path}|{entry.pairing_path}"
+    key = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()[:16]
+    materialized = sample_msa_root / "map_materialized" / key
+    if materialized.exists():
+        return materialized
+
+    _ensure_dir(materialized)
+    shutil.copy2(entry.non_pairing_path, materialized / "non_pairing.a3m")
+    shutil.copy2(entry.pairing_path, materialized / "pairing.a3m")
+    return materialized
+
+
+def _set_msa_dir_on_protein(protein: dict, msa_dir: Path) -> None:
     protein["msa"] = {
         "precomputed_msa_dir": str(msa_dir),
         "pairing_db": "uniref100",
     }
+
+
+def _write_single_chain_msa(
+    *,
+    sample_msa_root: Path,
+    sample_name: str,
+    chain_id: str,
+    sequence_norm: str,
+    tag: str,
+) -> Path:
+    safe_chain = _sanitize_name(chain_id) or "chain"
+    msa_dir = sample_msa_root / f"single_{safe_chain}_{tag}"
+    desc = f"{sample_name}_{safe_chain}_{tag}"
+    _write_single_sequence_msa(msa_dir, sequence_norm, desc)
+    return msa_dir
+
+
+def _resolve_enabled_chain_msa(
+    *,
+    sample_name: str,
+    chain_id: str,
+    role: str,
+    sequence_norm: str,
+    sample_msa_root: Path,
+    args,
+    map_index: MSAMapIndex,
+) -> Tuple[Optional[Path], Optional[str], Optional[str], Optional[str], List[str]]:
+    warnings: List[str] = []
+
+    map_entry, map_strategy = _resolve_map_entry(
+        map_index,
+        sample_id=sample_name,
+        chain_id=chain_id,
+        role=role,
+        sequence_norm=sequence_norm,
+    )
+    if map_entry is not None:
+        msa_dir = _materialize_map_entry_dir(map_entry, sample_msa_root)
+        warnings.extend(
+            _validate_msa_dir_exists(
+                msa_dir, sample_name=sample_name, chain_id=chain_id, source_label="map"
+            )
+        )
+        return msa_dir, "map", map_strategy, None, warnings
+
+    shared_dir_raw = args.target_msa_shared_dir if role == "target" else args.binder_msa_shared_dir
+    if shared_dir_raw:
+        msa_dir = Path(shared_dir_raw)
+        warnings.extend(
+            _validate_msa_dir_exists(
+                msa_dir, sample_name=sample_name, chain_id=chain_id, source_label="shared"
+            )
+        )
+        return msa_dir, "shared", "shared", None, warnings
+
+    cache_key: Optional[str] = None
+    cache_context: Optional[dict] = None
+    cache_dir: Optional[Path] = None
+    cache_mode = args.msa_cache_mode
+    if cache_mode != "none" and args.msa_cache_dir:
+        cache_key, cache_context = _build_cache_key_context(sequence_norm, role, args)
+        cache_dir = Path(args.msa_cache_dir) / cache_key
+
+        if cache_mode in {"readwrite", "read"} and _cache_entry_ready(cache_dir):
+            warnings.extend(
+                _validate_msa_dir_exists(
+                    cache_dir, sample_name=sample_name, chain_id=chain_id, source_label="cache"
+                )
+            )
+            return cache_dir, "cache", "cache", cache_key, warnings
+
+    if args.msa_provider != "mmseqs2":
+        return None, None, None, cache_key, warnings
+
+    if not sequence_norm:
+        warnings.append("empty sequence; cannot fetch from provider")
+        return None, None, None, cache_key, warnings
+
+    if cache_mode in {"readwrite", "write"} and cache_dir is not None and cache_context is not None:
+        lock_path = Path(args.msa_cache_dir) / ".locks" / f"{cache_key}.lock"
+        with _cache_lock(lock_path):
+            if cache_mode == "readwrite" and _cache_entry_ready(cache_dir):
+                warnings.extend(
+                    _validate_msa_dir_exists(
+                        cache_dir, sample_name=sample_name, chain_id=chain_id, source_label="cache"
+                    )
+                )
+                return cache_dir, "cache", "cache", cache_key, warnings
+
+            tmp_dir = Path(args.msa_cache_dir) / ".tmp" / f"{cache_key}_{os.getpid()}_{int(time.time()*1000)}"
+            _remove_tree(tmp_dir)
+            _ensure_dir(tmp_dir.parent)
+            _maybe_fetch_colabfold_msa(sequence_norm, tmp_dir, args)
+            _write_cache_manifest(tmp_dir, cache_context, sequence_norm)
+
+            if cache_dir.exists():
+                _remove_tree(cache_dir)
+            _ensure_dir(cache_dir.parent)
+            os.replace(tmp_dir, cache_dir)
+
+        warnings.extend(
+            _validate_msa_dir_exists(
+                cache_dir, sample_name=sample_name, chain_id=chain_id, source_label="fetched"
+            )
+        )
+        return cache_dir, "fetched", "fetch", cache_key, warnings
+
+    fetched_dir = sample_msa_root / "fetched" / f"{role}_{_hash_sequence(sequence_norm)[:16]}"
+    _maybe_fetch_colabfold_msa(sequence_norm, fetched_dir, args)
+    warnings.extend(
+        _validate_msa_dir_exists(
+            fetched_dir, sample_name=sample_name, chain_id=chain_id, source_label="fetched"
+        )
+    )
+    return fetched_dir, "fetched", "fetch", cache_key, warnings
+
+
+def _iter_protein_entries(json_dict: dict) -> Iterable[dict]:
+    samples = json_dict if isinstance(json_dict, list) else [json_dict]
+    for sample in samples:
+        for entry in sample.get("sequences", []):
+            protein = entry.get("proteinChain")
+            if protein:
+                yield protein
+
+
+def _role_for_chain(
+    *,
+    chain_id: str,
+    sequence_norm: str,
+    target_chain_ids: Set[str],
+    target_sequences: Set[str],
+) -> str:
+    if chain_id in target_chain_ids:
+        return "target"
+    if sequence_norm and sequence_norm in target_sequences:
+        return "target"
+    return "binder"
+
+
+def _apply_msa_resolution(
+    *,
+    json_dict: dict,
+    sample_name: str,
+    inter_dir: Path,
+    args,
+    map_index: MSAMapIndex,
+) -> List[dict]:
+    target_chain_ids = set(_parse_chain_list(args.target_chains))
+    target_sequences = {_normalize_sequence(seq) for seq in _load_fasta_sequences(args.target_chain_sequences)}
+
+    sample_msa_root = inter_dir / f"{sample_name}_msa"
+    _ensure_dir(sample_msa_root)
+
+    resolution_records: List[dict] = []
+    chain_counter = 0
+    for protein in _iter_protein_entries(json_dict):
+        chain_counter += 1
+        label_asym_ids = protein.get("label_asym_id") or []
+        chain_id = str(label_asym_ids[0]) if label_asym_ids else f"chain_{chain_counter}"
+        sequence_raw = str(protein.get("sequence", "") or "")
+        sequence_norm = _normalize_sequence(sequence_raw)
+        role = _role_for_chain(
+            chain_id=chain_id,
+            sequence_norm=sequence_norm,
+            target_chain_ids=target_chain_ids,
+            target_sequences=target_sequences,
+        )
+
+        enabled = _is_role_enabled(args.use_msas, role)
+        cache_key = None
+        warnings: List[str] = []
+        if not enabled:
+            msa_dir = _write_single_chain_msa(
+                sample_msa_root=sample_msa_root,
+                sample_name=sample_name,
+                chain_id=chain_id,
+                sequence_norm=sequence_norm,
+                tag=f"disabled_{chain_counter}",
+            )
+            source = "single"
+            match_strategy = "single"
+        else:
+            msa_dir, source, match_strategy, cache_key, warnings = _resolve_enabled_chain_msa(
+                sample_name=sample_name,
+                chain_id=chain_id,
+                role=role,
+                sequence_norm=sequence_norm,
+                sample_msa_root=sample_msa_root,
+                args=args,
+                map_index=map_index,
+            )
+            if msa_dir is None:
+                if args.msa_missing_policy == "single":
+                    msa_dir = _write_single_chain_msa(
+                        sample_msa_root=sample_msa_root,
+                        sample_name=sample_name,
+                        chain_id=chain_id,
+                        sequence_norm=sequence_norm,
+                        tag=f"fallback_{chain_counter}",
+                    )
+                    source = "single"
+                    match_strategy = "single"
+                    warnings.append("fallback to single-sequence due to unresolved MSA")
+                else:
+                    raise FileNotFoundError(
+                        f"{sample_name}: unable to resolve MSA for chain {chain_id} "
+                        f"(role={role}); checked map/shared/cache/provider with "
+                        f"msa_missing_policy={args.msa_missing_policy}"
+                    )
+
+        _set_msa_dir_on_protein(protein, msa_dir)
+        resolution_records.append(
+            {
+                "chain_id": chain_id,
+                "role": role,
+                "sequence_sha": _hash_sequence(sequence_norm),
+                "source": source,
+                "cache_key": cache_key,
+                "msa_dir": str(msa_dir),
+                "warnings": warnings,
+                "match_strategy": match_strategy,
+            }
+        )
+
+    return resolution_records
+
+
+def _map_entry_msa_dir_ready(entry: MSAMapEntry) -> bool:
+    if entry.msa_dir is not None:
+        return (entry.msa_dir / "non_pairing.a3m").exists()
+    if entry.non_pairing_path is None or entry.pairing_path is None:
+        return False
+    return entry.non_pairing_path.exists() and entry.pairing_path.exists()
+
+
+def _validate_msa_args(args) -> None:
+    if args.use_msas not in {"both", "target", "binder", "false"}:
+        raise ValueError(f"Invalid --use_msas value: {args.use_msas}")
+    if args.msa_provider not in {"mmseqs2", "none"}:
+        raise ValueError(f"Invalid --msa_provider value: {args.msa_provider}")
+    if args.msa_cache_mode not in {"readwrite", "read", "write", "none"}:
+        raise ValueError(f"Invalid --msa_cache_mode value: {args.msa_cache_mode}")
+    if args.msa_missing_policy not in {"error", "single"}:
+        raise ValueError(f"Invalid --msa_missing_policy value: {args.msa_missing_policy}")
+
+    if args.msa_provider == "none" and args.msa_cache_mode == "write":
+        raise ValueError("--msa_provider none cannot be combined with --msa_cache_mode write")
+
+    if args.msa_cache_mode != "none" and not args.msa_cache_dir:
+        args.msa_cache_dir = os.path.join(args.output, "msa_cache")
+
+    args.use_msa = True
+
+
+def _collect_chain_role_records_for_preflight(
+    *,
+    file_path: Path,
+    args,
+    inter_dir: Path,
+    chain_sequence_overrides: Dict[str, str],
+) -> List[Tuple[str, str, str]]:
+    sample_name = _sanitize_name(file_path.stem)
+    cif_path = file_path
+    cleanup_cif = False
+    if file_path.suffix.lower() == ".pdb":
+        cif_path = inter_dir / f"preflight_{sample_name}.cif"
+        pdb_to_cif(str(file_path), str(cif_path), entry_id=sample_name)
+        cleanup_cif = True
+
+    try:
+        json_dict, atom_array_src = _parse_structure_to_json(
+            cif_path=cif_path,
+            sample_name=sample_name,
+            assembly_id=args.assembly_id,
+            altloc=args.altloc,
+            output_json=None,
+        )
+        chain_sequences = _extract_chain_sequences(atom_array_src)
+        _apply_chain_sequence_overrides(
+            json_dict,
+            chain_sequences,
+            chain_sequence_overrides,
+            sample_name,
+        )
+        _replace_unknown_residues(json_dict, sample_name)
+
+        target_chain_ids = set(_parse_chain_list(args.target_chains))
+        target_sequences = {_normalize_sequence(seq) for seq in _load_fasta_sequences(args.target_chain_sequences)}
+
+        records: List[Tuple[str, str, str]] = []
+        for protein in _iter_protein_entries(json_dict):
+            label_asym_ids = protein.get("label_asym_id") or []
+            chain_id = str(label_asym_ids[0]) if label_asym_ids else "?"
+            sequence_norm = _normalize_sequence(str(protein.get("sequence", "") or ""))
+            role = _role_for_chain(
+                chain_id=chain_id,
+                sequence_norm=sequence_norm,
+                target_chain_ids=target_chain_ids,
+                target_sequences=target_sequences,
+            )
+            records.append((chain_id, role, sequence_norm))
+        return records
+    finally:
+        if cleanup_cif:
+            try:
+                os.remove(cif_path)
+            except OSError:
+                pass
+
+
+def _validate_msa_preflight(
+    *,
+    args,
+    input_files: List[Path],
+    map_index: MSAMapIndex,
+    inter_dir: Path,
+    chain_sequence_overrides: Dict[str, str],
+) -> None:
+    for entry in map_index.entries:
+        if not _map_entry_msa_dir_ready(entry):
+            raise FileNotFoundError(
+                f"--msa_map_csv row {entry.row_number}: MSA location is missing required files"
+            )
+
+    for shared_dir_raw, role in (
+        (args.target_msa_shared_dir, "target"),
+        (args.binder_msa_shared_dir, "binder"),
+    ):
+        if not shared_dir_raw:
+            continue
+        shared_dir = Path(shared_dir_raw)
+        if not (shared_dir / "non_pairing.a3m").exists():
+            raise FileNotFoundError(
+                f"--{role}_msa_shared_dir missing non_pairing.a3m: {shared_dir}"
+            )
+
+    if args.msa_provider != "none":
+        return
+
+    unresolved: List[str] = []
+    coverage_counts = {"map": 0, "shared": 0, "cache": 0}
+    for file_path in input_files:
+        sample_name = _sanitize_name(file_path.stem)
+        records = _collect_chain_role_records_for_preflight(
+            file_path=file_path,
+            args=args,
+            inter_dir=inter_dir,
+            chain_sequence_overrides=chain_sequence_overrides,
+        )
+        for chain_id, role, sequence_norm in records:
+            if not _is_role_enabled(args.use_msas, role):
+                continue
+
+            entry, _ = _resolve_map_entry(
+                map_index,
+                sample_id=sample_name,
+                chain_id=chain_id,
+                role=role,
+                sequence_norm=sequence_norm,
+            )
+            if entry is not None:
+                coverage_counts["map"] += 1
+                continue
+
+            shared_dir_raw = args.target_msa_shared_dir if role == "target" else args.binder_msa_shared_dir
+            if shared_dir_raw:
+                coverage_counts["shared"] += 1
+                continue
+
+            if args.msa_cache_mode in {"read", "readwrite"} and args.msa_cache_dir and sequence_norm:
+                cache_key, _ = _build_cache_key_context(sequence_norm, role, args)
+                cache_dir = Path(args.msa_cache_dir) / cache_key
+                if _cache_entry_ready(cache_dir):
+                    coverage_counts["cache"] += 1
+                    continue
+
+            unresolved.append(f"{sample_name}:{chain_id}:{role}")
+
+    if unresolved and args.msa_missing_policy == "error":
+        preview = ", ".join(unresolved[:10])
+        suffix = "" if len(unresolved) <= 10 else f" ... (+{len(unresolved) - 10} more)"
+        raise ValueError(
+            "--msa_provider none requires full pre-resolved coverage for enabled roles when "
+            "--msa_missing_policy=error. "
+            f"Unresolved chains: {preview}{suffix}"
+        )
+    if unresolved and args.msa_missing_policy == "single":
+        logger.warning(
+            "MSA preflight: %d enabled-role chains unresolved; they will fall back to single-sequence "
+            "because --msa_missing_policy=single and --msa_provider=none",
+            len(unresolved),
+        )
+
+    logger.info(
+        "MSA preflight coverage (provider=none): map=%d shared=%d cache=%d",
+        coverage_counts["map"],
+        coverage_counts["shared"],
+        coverage_counts["cache"],
+    )
+
+
+def _write_msa_resolution(sample_out_dir: Path, records: List[dict]) -> None:
+    with open(sample_out_dir / "msa_resolution.json", "w") as handle:
+        json.dump(records, handle, indent=2)
+
+
+def _write_msa_resolution_summary(output_dir: Path, results: List[ScoreResult]) -> None:
+    summary = {
+        "total_chains": 0,
+        "chains_by_role": {"target": 0, "binder": 0},
+        "source_counts": {"single": 0, "map": 0, "shared": 0, "cache": 0, "fetched": 0},
+        "fetch_count": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "single_policy_fallbacks": 0,
+    }
+    for result in results:
+        for rec in result.msa_resolution or []:
+            summary["total_chains"] += 1
+            role = rec.get("role")
+            if role in summary["chains_by_role"]:
+                summary["chains_by_role"][role] += 1
+            source = rec.get("source")
+            if source in summary["source_counts"]:
+                summary["source_counts"][source] += 1
+            if source == "fetched":
+                summary["fetch_count"] += 1
+                summary["cache_misses"] += 1
+            if source == "cache":
+                summary["cache_hits"] += 1
+            warnings = rec.get("warnings", [])
+            if any("fallback to single-sequence" in str(item) for item in warnings):
+                summary["single_policy_fallbacks"] += 1
+
+    with open(output_dir / "msa_resolution_summary.json", "w") as handle:
+        json.dump(summary, handle, indent=2)
 
 
 def _maybe_fetch_colabfold_msa(
@@ -307,7 +1067,7 @@ def _maybe_fetch_colabfold_msa(
     from protenixscore.msa_colabfold import ColabFoldMSAConfig, ensure_msa_dir
 
     cfg = ColabFoldMSAConfig(
-        host_url=args.msa_host,
+        host_url=args.msa_host_url,
         use_env=args.msa_use_env,
         use_filter=args.msa_use_filter,
     )
@@ -322,85 +1082,6 @@ def _write_single_sequence_msa(msa_dir: Path, sequence: str, description: str) -
     for fname in ("non_pairing.a3m", "pairing.a3m"):
         with open(msa_dir / fname, "w") as f:
             f.write(content)
-
-
-def _inject_precomputed_msa(
-    json_dict: dict,
-    msa_base_dir: Path,
-    sample_name: str,
-) -> int:
-    if isinstance(json_dict, list):
-        samples = json_dict
-    else:
-        samples = [json_dict]
-    msa_count = 0
-    for sample in samples:
-        sequences = sample.get("sequences", [])
-        protein_idx = 0
-        for entry in sequences:
-            protein = entry.get("proteinChain")
-            if not protein:
-                continue
-            protein_idx += 1
-            if "msa" in protein:
-                continue
-            msa_dir = msa_base_dir / f"entity_{protein_idx}"
-            non_pairing = msa_dir / "non_pairing.a3m"
-            if not non_pairing.exists():
-                raise FileNotFoundError(
-                    f"{sample_name}: missing MSA file {non_pairing}"
-                )
-            protein["msa"] = {
-                "precomputed_msa_dir": str(msa_dir),
-                "pairing_db": "uniref100",
-            }
-            msa_count += 1
-    if msa_count > 0:
-        logger.info(
-            "%s: injected precomputed MSA for %d protein entities",
-            sample_name,
-            msa_count,
-        )
-    return msa_count
-
-
-def _inject_single_sequence_msa(json_dict: dict, msa_base_dir: Path, sample_name: str) -> int:
-    if isinstance(json_dict, list):
-        samples = json_dict
-    else:
-        samples = [json_dict]
-    msa_count = 0
-    for sample in samples:
-        sequences = sample.get("sequences", [])
-        protein_idx = 0
-        for entry in sequences:
-            protein = entry.get("proteinChain")
-            if not protein:
-                continue
-            protein_idx += 1
-            if "msa" in protein:
-                continue
-            sequence = protein.get("sequence", "")
-            if not sequence:
-                continue
-            msa_dir = msa_base_dir / f"entity_{protein_idx}"
-            desc = f"{sample_name}_entity_{protein_idx}"
-            _write_single_sequence_msa(msa_dir, sequence, desc)
-            protein["msa"] = {
-                "precomputed_msa_dir": str(msa_dir),
-                "pairing_db": "uniref100",
-            }
-            msa_count += 1
-    if msa_count > 0:
-        logger.info("%s: injected single-sequence MSA for %d protein entities", sample_name, msa_count)
-    return msa_count
-
-
-def _resolve_msa_base(msa_path: Path, sample_name: str) -> Path:
-    per_sample = msa_path / sample_name
-    if per_sample.exists():
-        return per_sample
-    return msa_path
 
 
 def _build_chain_id_map(
@@ -752,97 +1433,21 @@ def _score_single(
         sample_name,
     )
     _replace_unknown_residues(json_dict, sample_name)
-    if args.use_msa:
-        target_chain_ids = set(_parse_chain_list(args.target_chains))
-        target_sequences = set(_load_fasta_sequences(args.target_chain_sequences))
-        use_target_strategy = bool(
-            target_chain_ids
-            or target_sequences
-            or args.target_msa_path
-            or args.msa_cache_dir
-            or args.msa_source != "none"
-        )
-
-        if not use_target_strategy:
-            if args.msa_path:
-                msa_root = _resolve_msa_base(Path(args.msa_path), sample_name)
-                _inject_precomputed_msa(json_dict, msa_root, sample_name)
-            else:
-                msa_base_dir = inter_dir / f"{sample_name}_msa"
-                _ensure_dir(msa_base_dir)
-                _inject_single_sequence_msa(json_dict, msa_base_dir, sample_name)
-        else:
-            if args.msa_path:
-                logger.warning(
-                    "%s: --msa_path ignored because target MSA strategy is enabled",
-                    sample_name,
-                )
-
-            target_msa_base = Path(args.target_msa_path) if args.target_msa_path else None
-            msa_cache_dir = Path(args.msa_cache_dir) if args.msa_cache_dir else None
-            if args.msa_source == "colabfold" and msa_cache_dir is None and target_msa_base is None:
-                raise ValueError(
-                    "--msa_source colabfold requires --msa_cache_dir or --target_msa_path"
-                )
-
-            msa_base_dir = inter_dir / f"{sample_name}_msa"
-            _ensure_dir(msa_base_dir)
-
-            target_idx = 0
-            protein_idx = 0
-            samples = json_dict if isinstance(json_dict, list) else [json_dict]
-            for sample in samples:
-                sequences = sample.get("sequences", [])
-                for entry in sequences:
-                    protein = entry.get("proteinChain")
-                    if not protein:
-                        continue
-                    protein_idx += 1
-                    label_asym_ids = protein.get("label_asym_id") or []
-                    chain_id = label_asym_ids[0] if label_asym_ids else "?"
-                    sequence = protein.get("sequence", "")
-                    is_target = False
-                    if chain_id in target_chain_ids:
-                        is_target = True
-                    elif sequence and sequence in target_sequences:
-                        is_target = True
-
-                    if is_target:
-                        target_idx += 1
-                        if target_msa_base is not None:
-                            msa_dir = target_msa_base / f"entity_{target_idx}"
-                            _set_precomputed_msa(protein, msa_dir, sample_name, chain_id)
-                        elif msa_cache_dir is not None:
-                            msa_dir = msa_cache_dir / _hash_sequence(sequence)
-                            if not (msa_dir / "non_pairing.a3m").exists():
-                                if args.msa_source == "colabfold":
-                                    _maybe_fetch_colabfold_msa(sequence, msa_dir, args)
-                                else:
-                                    raise FileNotFoundError(
-                                        f"{sample_name}: target MSA cache miss for chain {chain_id} "
-                                        f"and msa_source={args.msa_source}"
-                                    )
-                            _set_precomputed_msa(protein, msa_dir, sample_name, chain_id)
-                        else:
-                            raise ValueError(
-                                f"{sample_name}: target chain {chain_id} requires "
-                                "--target_msa_path or --msa_cache_dir"
-                            )
-                    else:
-                        if args.binder_msa_mode == "single":
-                            msa_dir = msa_base_dir / f"entity_{protein_idx}"
-                            _write_single_sequence_msa(msa_dir, sequence, f"{sample_name}_entity_{protein_idx}")
-                            protein["msa"] = {
-                                "precomputed_msa_dir": str(msa_dir),
-                                "pairing_db": "uniref100",
-                            }
-                        elif args.binder_msa_mode == "none":
-                            continue
-                        else:
-                            raise ValueError(f"Unknown binder_msa_mode: {args.binder_msa_mode}")
-
-        with open(json_path, "w") as f:
-            json.dump(json_dict, f, indent=2)
+    map_index = getattr(
+        args,
+        "_msa_map_index",
+        MSAMapIndex(sample_chain={}, role_sequence={}, sequence_only={}, entries=[]),
+    )
+    msa_resolution = _apply_msa_resolution(
+        json_dict=json_dict,
+        sample_name=sample_name,
+        inter_dir=inter_dir,
+        args=args,
+        map_index=map_index,
+    )
+    _write_msa_resolution(sample_out_dir, msa_resolution)
+    with open(json_path, "w") as f:
+        json.dump(json_dict, f, indent=2)
 
     # Protenix v1+ expects InferenceDataset(configs) where configs carries
     # input_json_path/dump_dir/use_msa. Older Protenix versions accepted these
@@ -971,6 +1576,7 @@ def _score_single(
         summary=summary,
         full_data=full_data,
         output_dir=sample_out_dir,
+        msa_resolution=msa_resolution,
         prep_seconds=prep_seconds,
         model_seconds=model_seconds,
         total_seconds=total_seconds,
@@ -1005,11 +1611,7 @@ def run_score(args) -> None:
     if not args.score_only:
         raise ValueError("Only score-only mode is supported.")
 
-    if args.use_msa and (args.target_chains or args.target_chain_sequences):
-        if args.msa_source == "none" and args.msa_cache_dir is None and args.target_msa_path is None:
-            args.msa_source = "colabfold"
-        if args.msa_source == "colabfold" and args.msa_cache_dir is None and args.target_msa_path is None:
-            args.msa_cache_dir = os.path.join(args.output, "msa_cache")
+    _validate_msa_args(args)
 
     _configure_device(args.device)
 
@@ -1024,40 +1626,69 @@ def run_score(args) -> None:
         logger.warning("batch_size > 1 is not supported yet; using 1")
 
     inter_dir, temp_dir = _prepare_intermediate_dirs(output_dir, args.keep_intermediate, args.intermediate_dir)
+    try:
+        chain_sequence_overrides = _parse_chain_sequence_overrides(
+            getattr(args, "chain_sequence", [])
+        )
+        map_index = _load_msa_map_index(getattr(args, "msa_map_csv", None))
+        args._msa_map_index = map_index
 
-    runner = _load_runner(args)
+        if args.msa_cache_mode != "none" and args.msa_cache_dir:
+            _ensure_dir(Path(args.msa_cache_dir))
 
-    chain_sequence_overrides = _parse_chain_sequence_overrides(
-        getattr(args, "chain_sequence", [])
-    )
-
-    failed_records: List[str] = []
-    results: List[ScoreResult] = []
-
-    for file_path in input_files:
-        try:
-            result = _score_single(
-                file_path=file_path,
-                runner=runner,
+        if getattr(args, "validate_msa_inputs", True):
+            _validate_msa_preflight(
                 args=args,
-                output_dir=output_dir,
+                input_files=input_files,
+                map_index=map_index,
                 inter_dir=inter_dir,
                 chain_sequence_overrides=chain_sequence_overrides,
             )
-            results.append(result)
-        except Exception as exc:
-            logger.exception("Failed to score %s", file_path)
-            failed_records.append(
-                f"{file_path}:\n{traceback.format_exc()}"
-            )
 
-    if failed_records:
-        failed_path = Path(args.failed_log)
-        _ensure_dir(failed_path.parent)
-        with open(failed_path, "w") as f:
-            f.write("\n".join(failed_records))
+        logger.info(
+            "MSA config: use_msas=%s provider=%s cache_mode=%s cache_dir=%s map_csv=%s "
+            "target_shared=%s binder_shared=%s missing_policy=%s validate=%s",
+            args.use_msas,
+            args.msa_provider,
+            args.msa_cache_mode,
+            args.msa_cache_dir,
+            args.msa_map_csv,
+            args.target_msa_shared_dir,
+            args.binder_msa_shared_dir,
+            args.msa_missing_policy,
+            args.validate_msa_inputs,
+        )
 
-    _write_aggregate_csv(results, Path(args.aggregate_csv))
+        runner = _load_runner(args)
 
-    if temp_dir is not None:
-        temp_dir.cleanup()
+        failed_records: List[str] = []
+        results: List[ScoreResult] = []
+
+        for file_path in input_files:
+            try:
+                result = _score_single(
+                    file_path=file_path,
+                    runner=runner,
+                    args=args,
+                    output_dir=output_dir,
+                    inter_dir=inter_dir,
+                    chain_sequence_overrides=chain_sequence_overrides,
+                )
+                results.append(result)
+            except Exception:
+                logger.exception("Failed to score %s", file_path)
+                failed_records.append(
+                    f"{file_path}:\n{traceback.format_exc()}"
+                )
+
+        if failed_records:
+            failed_path = Path(args.failed_log)
+            _ensure_dir(failed_path.parent)
+            with open(failed_path, "w") as f:
+                f.write("\n".join(failed_records))
+
+        _write_aggregate_csv(results, Path(args.aggregate_csv))
+        _write_msa_resolution_summary(output_dir, results)
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()

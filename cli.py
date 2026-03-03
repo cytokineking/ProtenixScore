@@ -63,16 +63,48 @@ def build_parser() -> argparse.ArgumentParser:
 
     score.add_argument("--score_only", action="store_true", default=True, help="Score-only mode (always on)")
     score.add_argument(
-        "--use_msa",
-        type=_str2bool,
-        default=True,
-        help="Enable MSA features (true/false). Default: true",
+        "--use_msas",
+        default="both",
+        choices=["both", "target", "binder", "false"],
+        help="Real-MSA usage mode by role (default: both).",
     )
     score.add_argument("--use_esm", action="store_true", default=False, help="Enable ESM embeddings")
+    score.add_argument("--msa_map_csv", default=None, help="CSV map for provided MSAs.")
+    score.add_argument("--target_msa_shared_dir", default=None, help="Shared MSA dir for all target chains.")
+    score.add_argument("--binder_msa_shared_dir", default=None, help="Shared MSA dir for all binder chains.")
     score.add_argument(
-        "--msa_path",
+        "--msa_provider",
+        default="mmseqs2",
+        choices=["mmseqs2", "none"],
+        help="Provider for unresolved enabled-role MSAs (default: mmseqs2).",
+    )
+    score.add_argument(
+        "--msa_host_url",
+        default="https://api.colabfold.com",
+        help="MMseqs2/ColabFold-compatible host URL.",
+    )
+    score.add_argument(
+        "--msa_cache_mode",
+        default="readwrite",
+        choices=["readwrite", "read", "write", "none"],
+        help="MSA cache read/write policy (default: readwrite).",
+    )
+    score.add_argument(
+        "--msa_cache_dir",
         default=None,
-        help="Path to precomputed MSA dirs (per-sample or shared).",
+        help="MSA cache dir (default: <output>/msa_cache when cache mode is not none).",
+    )
+    score.add_argument(
+        "--msa_missing_policy",
+        default="error",
+        choices=["error", "single"],
+        help="Behavior when enabled-role MSA is unresolved (default: error).",
+    )
+    score.add_argument(
+        "--validate_msa_inputs",
+        type=_str2bool,
+        default=True,
+        help="Run fail-fast MSA preflight validation (true/false). Default: true",
     )
     score.add_argument(
         "--chain_sequence",
@@ -89,33 +121,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--target_chain_sequences",
         default=None,
         help="FASTA file with target sequences (match by sequence).",
-    )
-    score.add_argument(
-        "--target_msa_path",
-        default=None,
-        help="Path to target MSA dirs (entity_1, entity_2, ...).",
-    )
-    score.add_argument(
-        "--binder_msa_mode",
-        default="single",
-        choices=["single", "none"],
-        help="MSA mode for binder chains (default: single).",
-    )
-    score.add_argument(
-        "--msa_cache_dir",
-        default=None,
-        help="Cache dir for target MSAs (hashed by sequence).",
-    )
-    score.add_argument(
-        "--msa_source",
-        default="none",
-        choices=["none", "colabfold"],
-        help="How to generate target MSAs when not cached.",
-    )
-    score.add_argument(
-        "--msa_host",
-        default="https://api.colabfold.com",
-        help="ColabFold server host URL.",
     )
     score.add_argument(
         "--msa_use_env",
@@ -210,11 +215,13 @@ def _interactive_args() -> argparse.Namespace:
         "Checkpoint dir (optional)",
         DEFAULT_CHECKPOINT_DIR or "",
     )
-    use_msa = _prompt_bool("Use MSA", True)
+    use_msas = _prompt("use_msas (both|target|binder|false)", "both")
     use_esm = _prompt_bool("Use ESM", False)
     dtype = _prompt("dtype (fp32|bf16|fp16)", "bf16")
     device = _prompt("device (cpu|cuda:N|auto)", "auto")
-    msa_path = _prompt("MSA path (optional)", "")
+    msa_map_csv = _prompt("MSA map CSV (optional)", "")
+    target_msa_shared_dir = _prompt("Shared target MSA dir (optional)", "")
+    binder_msa_shared_dir = _prompt("Shared binder MSA dir (optional)", "")
 
     args = argparse.Namespace(
         command="score",
@@ -223,17 +230,20 @@ def _interactive_args() -> argparse.Namespace:
         recursive=False,
         glob=DEFAULT_GLOBS,
         score_only=True,
-        use_msa=use_msa,
+        use_msas=use_msas,
         use_esm=use_esm,
-        msa_path=msa_path or None,
+        msa_map_csv=msa_map_csv or None,
+        target_msa_shared_dir=target_msa_shared_dir or None,
+        binder_msa_shared_dir=binder_msa_shared_dir or None,
+        msa_provider="mmseqs2",
+        msa_host_url="https://api.colabfold.com",
+        msa_cache_mode="readwrite",
+        msa_cache_dir=None,
+        msa_missing_policy="error",
+        validate_msa_inputs=True,
         chain_sequence=[],
         target_chains=None,
         target_chain_sequences=None,
-        target_msa_path=None,
-        binder_msa_mode="single",
-        msa_cache_dir=None,
-        msa_source="none",
-        msa_host="https://api.colabfold.com",
         msa_use_env=True,
         msa_use_filter=True,
         msa_cache_refresh=False,

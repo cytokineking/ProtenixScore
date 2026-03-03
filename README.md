@@ -12,7 +12,7 @@ Key features
 - Score-only mode: uses provided coordinates, no diffusion sampling.
 - PDB or CIF input, with automatic PDB -> CIF conversion.
 - Per-structure outputs plus an aggregate CSV summary.
-- MSA features enabled by default (single-sequence MSA is injected if not provided).
+- Deterministic MSA resolution with map/shared/cache/fetch fallback.
 - ipSAE metrics (AF3Score-style) computed from Protenix token-pair PAE.
 
 ## Requirements
@@ -80,10 +80,12 @@ For each input structure `sample`, outputs are written to:
 <output>/
   summary.csv
   failed_records.txt
+  msa_resolution_summary.json
   <sample>/
     summary_confidence.json
     full_confidence.json
     chain_id_map.json
+    msa_resolution.json
     missing_atoms.json   (only if missing atoms were detected)
 ```
 
@@ -92,6 +94,8 @@ Notes:
 - `failed_records.txt` is written only if one or more inputs fail.
 - `chain_id_map.json` records the mapping between Protenix internal chain IDs
   and source chain IDs.
+- `msa_resolution.json` records where each chain's MSA came from (`single|map|shared|cache|fetched`).
+- `msa_resolution_summary.json` aggregates run-level MSA source counts and fetch/cache stats.
 - `missing_atoms.json` is written when coordinates are missing and a fallback
   policy is used.
 
@@ -128,18 +132,20 @@ Which ipSAE metric should you use?
 - `--checkpoint_dir` (optional, overrides default checkpoint location)
 - `--device` (`cpu|cuda:N|auto`, default: `auto`)
 - `--dtype` (`fp32|bf16|fp16`, default: `bf16`)
-- `--use_msa` (default: true; injects single-sequence MSA if none provided)
-- `--msa_path` (optional; use precomputed MSA instead of dummy)
+- `--use_msas` (`both|target|binder|false`, default: `both`)
+- `--msa_map_csv` (optional; CSV map for chain/sequence-provided MSAs)
+- `--target_msa_shared_dir` / `--binder_msa_shared_dir` (optional shared MSA dirs by role)
+- `--msa_provider` (`mmseqs2|none`, default: `mmseqs2`)
+- `--msa_host_url` (default: `https://api.colabfold.com`)
+- `--msa_cache_mode` (`readwrite|read|write|none`, default: `readwrite`)
+- `--msa_cache_dir` (optional; defaults to `<output>/msa_cache` when cache mode is not `none`)
+- `--msa_missing_policy` (`error|single`, default: `error`)
+- `--validate_msa_inputs` (`true|false`, default: `true`)
 - `--chain_sequence` (optional; override chain sequences, format `A=SEQUENCE`, repeatable)
 - `--target_chains` (optional; comma-separated chain IDs to treat as target)
 - `--target_chain_sequences` (optional; FASTA of target sequences to match by sequence)
-- `--target_msa_path` (optional; precomputed target MSAs in entity_1/, entity_2/, ...)
-- `--binder_msa_mode` (default: single; single or none)
-- `--msa_cache_dir` (optional; cache target MSAs by sequence hash)
-- `--msa_source` (none|colabfold; how to generate target MSAs when cache miss)
-- `--msa_host` (ColabFold server URL)
-- `--msa_use_env` / `--msa_use_filter` (ColabFold controls, default true)
-- `--msa_cache_refresh` (force re-fetch MSAs even if cached)
+- `--msa_use_env` / `--msa_use_filter` (MMseqs2/ColabFold controls, default true)
+- `--msa_cache_refresh` (force re-fetch when fetching into cache/write paths)
 - `--use_esm` (optional)
 - `--convert_pdb_to_cif` (always on for PDB input)
 - `--missing_atom_policy` (`reference|zero|error`, default: `reference`)
@@ -155,34 +161,91 @@ Which ipSAE metric should you use?
 4. Map source atom coordinates to Protenix atom ordering.
 5. Run Protenix confidence head with the provided coordinates.
 
+## MSA handling (important)
+
+Use `--use_msas` to control which roles need real MSAs:
+
+- `both`: target and binder chains use real MSAs.
+- `target`: only target chains use real MSAs, binders are single-sequence.
+- `binder`: only binder chains use real MSAs, targets are single-sequence.
+- `false`: all chains use single-sequence MSAs.
+
+Resolution order for enabled roles is deterministic:
+
+1. `--msa_map_csv` exact `sample_id + chain_id`.
+2. `--msa_map_csv` `role + sequence`.
+3. `--msa_map_csv` `sequence` (must be unique).
+4. shared role directory (`--target_msa_shared_dir` / `--binder_msa_shared_dir`).
+5. cache (`--msa_cache_dir`) according to `--msa_cache_mode`.
+6. fetch from provider (`--msa_provider mmseqs2`).
+7. unresolved -> `--msa_missing_policy` (`error` by default).
+
+If `--msa_provider none` is set, unresolved enabled-role chains still obey
+`--msa_missing_policy` (`error` fails fast, `single` falls back to single-sequence).
+
+Ambiguous map lookups are hard errors.
+
+## MSA map CSV
+
+Supported columns:
+
+- match selectors: `sample_id` (or `sample`), `chain_id`, `sequence`, `role`
+- location: `msa_dir` OR (`pairing_path` + `non_pairing_path`)
+
+Rules:
+
+- At least one selector strategy is required: `sample_id+chain_id` and/or `sequence`.
+- Duplicate keys are hard errors (`sample_id+chain_id`, `role+sequence`, sequence-only).
+- `sample_id` is normalized using the same sample sanitizer as scoring.
+- `sequence` matching normalizes by uppercasing and removing spaces/gaps.
+
+Template:
+
+```csv
+sample_id,chain_id,role,msa_dir
+complex_0001,A,target,/data/msa/complex_0001_A
+complex_0001,H,binder,/data/msa/complex_0001_H
+```
+
+Sequence-level reuse:
+
+```csv
+role,sequence,msa_dir
+target,EVQLVESGGGLVQPGGSLRLS...,/data/msa/target_shared_1
+binder,QVQLQQSGAELVKPGASVK...,/data/msa/binder_shared_heavy_chain
+```
+
 ## Target/binder batch workflow (recommended for many binders vs one target)
 
-If you are scoring many binders against a fixed target, reuse a single target MSA
-and use single-sequence MSAs for binders:
+If you are scoring many binders against a fixed target:
 
 ```bash
 python -m protenixscore score \
   --input ./ranked \
   --output ./scores \
   --recursive \
+  --use_msas both \
   --target_chains A \
-  --binder_msa_mode single \
+  --target_msa_shared_dir ./msas/target_shared \
   --msa_cache_dir ./msa_cache \
-  --msa_source colabfold
+  --msa_provider mmseqs2
 ```
 
 Notes:
-- Target MSAs are cached by sequence hash under `--msa_cache_dir`.
-- Binder chains are kept in single-sequence mode for speed.
+- Target chains use the shared target MSA.
+- Binder chains resolve via map/cache/fetch based on your flags.
 
-MSA notes:
-- Protenix confidence scoring relies on MSAs; use precomputed MSAs or enable fetching
-  so the target chain has a real MSA.
-- Use `--msa_path` to point to precomputed MSAs laid out as `entity_1/`, `entity_2/`, etc.
-  For batch runs you can also provide per-sample subfolders under `/path/to/msa/<sample_name>/entity_*`.
-- When you set `--target_chains` (or `--target_chain_sequences`) and do not provide
-  `--target_msa_path` / `--msa_cache_dir`, ProtenixScore defaults to fetching target
-  MSAs from the ColabFold server and caches them under `<output>/msa_cache`.
+If you have explicit per-chain mappings, use `--msa_map_csv`:
+
+```bash
+python -m protenixscore score \
+  --input ./ranked \
+  --output ./scores \
+  --recursive \
+  --use_msas both \
+  --target_chains A \
+  --msa_map_csv ./examples/msa_map_template.csv
+```
 
 ## Troubleshooting
 
