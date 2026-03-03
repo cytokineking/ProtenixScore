@@ -128,7 +128,7 @@ Which ipSAE metric should you use?
 
 ## Common options
 
-- `--model_name` (default: `protenix_base_default_v0.5.0`)
+- `--model_name` (default: `protenix_base_default_v1.0.0`)
 - `--checkpoint_dir` (optional, overrides default checkpoint location)
 - `--device` (`cpu|cuda:N|auto`, default: `auto`)
 - `--dtype` (`fp32|bf16|fp16`, default: `bf16`)
@@ -182,6 +182,7 @@ Resolution order for enabled roles is deterministic:
 
 If `--msa_provider none` is set, unresolved enabled-role chains still obey
 `--msa_missing_policy` (`error` fails fast, `single` falls back to single-sequence).
+`--msa_provider none` still reads existing mmseqs2 cache entries in read/readwrite modes.
 
 Ambiguous map lookups are hard errors.
 

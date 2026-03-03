@@ -158,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     score.add_argument(
         "--model_name",
-        default="protenix_base_default_v0.5.0",
+        default="protenix_base_default_v1.0.0",
         help="Protenix model name",
     )
     score.add_argument("--device", default="auto", help="cpu|cuda:N|auto")
@@ -210,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _interactive_args() -> argparse.Namespace:
     input_path = _prompt("Input PDB/CIF path")
     output_path = _prompt("Output directory", "./protenixscore_out")
-    model_name = _prompt("Model name", "protenix_base_default_v0.5.0")
+    model_name = _prompt("Model name", "protenix_base_default_v1.0.0")
     checkpoint_dir = _prompt(
         "Checkpoint dir (optional)",
         DEFAULT_CHECKPOINT_DIR or "",

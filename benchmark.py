@@ -79,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--msa_cache_refresh", type=_str2bool, default=False)
 
     parser.add_argument("--checkpoint_dir", default=os.environ.get("PROTENIX_CHECKPOINT_DIR"))
-    parser.add_argument("--model_name", default="protenix_base_default_v0.5.0")
+    parser.add_argument("--model_name", default="protenix_base_default_v1.0.0")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--num_workers", type=int, default=4)

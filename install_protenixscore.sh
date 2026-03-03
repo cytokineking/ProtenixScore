@@ -18,7 +18,7 @@ DATA_DIR="${SCRIPT_DIR}/protenix_data"
 SKIP_WEIGHTS=0
 SKIP_CCD=0
 CPU_MODE=0
-MODEL_NAME="protenix_base_default_v0.5.0"
+MODEL_NAME="protenix_base_default_v1.0.0"
 
 print_usage() {
   cat <<EOF
@@ -116,6 +116,37 @@ import sys
 if sys.version_info < (3, 11):
     raise SystemExit("Python >=3.11 required by Protenix")
 PY
+fi
+
+# Ensure ninja is available for PyTorch/Protenix extension builds.
+# We need both:
+# 1) importable python module (`import ninja`)
+# 2) `ninja` executable discoverable on PATH
+if ! python - <<'PY' >/dev/null 2>&1; then
+import importlib.util
+import shutil
+import sys
+has_module = importlib.util.find_spec("ninja") is not None
+has_binary = shutil.which("ninja") is not None
+sys.exit(0 if (has_module and has_binary) else 1)
+PY
+  echo "Installing ninja (required for fused extension compilation)"
+  python -m pip install --upgrade ninja
+fi
+
+if ! python - <<'PY' >/dev/null 2>&1; then
+import importlib.util
+import shutil
+import sys
+has_module = importlib.util.find_spec("ninja") is not None
+has_binary = shutil.which("ninja") is not None
+sys.exit(0 if (has_module and has_binary) else 1)
+PY
+  echo "ninja installation check failed: module and executable must both be available." >&2
+  echo "Try: python -m pip install --upgrade ninja and ensure your env bin is on PATH." >&2
+  exit 1
+else
+  echo "ninja module + executable available in current environment."
 fi
 
 if [[ -d "${PROTENIX_DIR}" ]]; then

@@ -564,11 +564,14 @@ def _cache_lock(lock_path: Path, timeout_sec: float = 300.0, stale_sec: float = 
 
 
 def _build_cache_key_context(sequence_norm: str, role: str, args) -> Tuple[str, dict]:
+    # `msa_provider=none` means "no fetch", not a separate cache namespace.
+    # Cache keys should remain compatible with entries written via the mmseqs2 backend.
+    cache_provider = "mmseqs2" if args.msa_provider in {"mmseqs2", "none"} else args.msa_provider
     context = {
         "version": "msa_cache_v1",
         "normalized_sequence": sequence_norm,
         "role": role,
-        "provider": args.msa_provider,
+        "provider": cache_provider,
         "host_url": args.msa_host_url,
         "pairing_strategy": "colabfold_single_query",
     }
