@@ -32,13 +32,25 @@ cd protenixscore
 ./install_protenixscore.sh
 ```
 
-This clones the pinned Protenix fork (modified to support score-only mode), installs dependencies, and downloads
-weights/CCD data unless skipped. It also wires up `PROTENIX_CHECKPOINT_DIR` and
+This clones the pinned Protenix fork (with the Protenix v2 merge and score-only support), installs dependencies, and downloads
+weights/CCD data unless skipped. By default it installs the `protenix-v2` checkpoint. It also wires up `PROTENIX_CHECKPOINT_DIR` and
 `PROTENIX_DATA_ROOT_DIR` (conda activation or printed for manual export).
 See `./install_protenixscore.sh --help` for options.
 
 By default, `install_protenixscore.sh` pins the Protenix fork to a specific git commit for reproducibility.
 Override with `--commit <sha>` (or pass an empty commit string to follow `--branch`).
+The installer downloads the `protenix-v2` checkpoint by default, and the CLI also
+defaults to `--model_name protenix-v2`. If you want to score with the older v1 base
+model, install that checkpoint with
+`--model-name protenix_base_default_v1.0.0` and then pass
+`--model_name protenix_base_default_v1.0.0` when scoring. The installer downloads
+only the selected checkpoint, so if you later want to score with another model you
+will need to rerun the installer with `--model-name` or place that model's `.pt`
+file into `PROTENIX_CHECKPOINT_DIR`.
+
+If you keep multiple Protenix checkouts around, set `PROTENIX_REPO_DIR=/path/to/Protenix_fork`
+before running `python -m protenixscore ...` or `python benchmark.py ...` to force
+discovery to use that exact checkout.
 
 Protenix original repository:
 https://github.com/bytedance/Protenix
@@ -128,7 +140,7 @@ Which ipSAE metric should you use?
 
 ## Common options
 
-- `--model_name` (default: `protenix_base_default_v1.0.0`)
+- `--model_name` (default: `protenix-v2`; pass `protenix_base_default_v1.0.0` to opt into v1)
 - `--checkpoint_dir` (optional, overrides default checkpoint location)
 - `--device` (`cpu|cuda:N|auto`, default: `auto`)
 - `--dtype` (`fp32|bf16|fp16`, default: `bf16`)

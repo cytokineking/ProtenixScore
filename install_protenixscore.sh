@@ -10,7 +10,7 @@ FORK_URL="https://github.com/cytokineking/Protenix"
 FORK_BRANCH="main"
 # Pin the Protenix fork to a specific commit for reproducible installs.
 # Override with --commit <sha> (or pass an empty string to follow --branch).
-FORK_COMMIT="6f3a6175f372161d668b505356cff0a7d91fe520"
+FORK_COMMIT="8c93234e0b53cc1ceeecb3fb8cd9d58fb7803d78"
 PROTENIX_DIR="${SCRIPT_DIR}/Protenix_fork"
 PROTENIXSCORE_DIR="${SCRIPT_DIR}"
 CHECKPOINT_DIR=""
@@ -18,7 +18,7 @@ DATA_DIR="${SCRIPT_DIR}/protenix_data"
 SKIP_WEIGHTS=0
 SKIP_CCD=0
 CPU_MODE=0
-MODEL_NAME="protenix_base_default_v1.0.0"
+MODEL_NAME="protenix-v2"
 
 print_usage() {
   cat <<EOF

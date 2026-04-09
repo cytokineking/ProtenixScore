@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import List
 
+from protenixscore import discover_protenix_dir, get_loaded_protenix_dir
 from protenixscore.cli import _str2bool
 from protenixscore.score import (
     _configure_device,
@@ -33,6 +34,35 @@ def _parse_globs(value: str) -> List[str]:
 
 def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2))
+
+
+def _resolve_benchmark_repos(args) -> tuple[Path, Path]:
+    score_repo = get_loaded_protenix_dir()
+    if score_repo is None:
+        raise FileNotFoundError(
+            "Could not determine the Protenix checkout used by protenixscore imports."
+        )
+    score_repo = score_repo.resolve()
+
+    infer_repo = Path(args.inference_repo).expanduser().resolve() if args.inference_repo else discover_protenix_dir()
+    if infer_repo is None:
+        raise FileNotFoundError(
+            "Could not discover a Protenix checkout. Set PROTENIX_REPO_DIR or pass --inference_repo explicitly."
+        )
+    infer_repo = infer_repo.resolve()
+    infer_script = infer_repo / "runner" / "inference.py"
+    if not infer_script.exists() or not (infer_repo / "protenix").is_dir():
+        raise FileNotFoundError(f"Not a valid Protenix checkout: {infer_repo}")
+
+    if score_repo != infer_repo:
+        raise RuntimeError(
+            "Benchmark repo mismatch: score-only imports are using "
+            f"{score_repo}, but full inference would use {infer_repo}. "
+            "Pass --inference_repo to match the loaded checkout or set PROTENIX_REPO_DIR "
+            "before starting the benchmark."
+        )
+
+    return score_repo, infer_repo
 
 
 def _parse_forward_times(log_path: Path) -> List[float]:
@@ -79,12 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--msa_cache_refresh", type=_str2bool, default=False)
 
     parser.add_argument("--checkpoint_dir", default=os.environ.get("PROTENIX_CHECKPOINT_DIR"))
-    parser.add_argument("--model_name", default="protenix_base_default_v1.0.0")
+    parser.add_argument("--model_name", default="protenix-v2")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--num_workers", type=int, default=4)
 
-    parser.add_argument("--inference_repo", default=None, help="Path to Protenix repo")
+    parser.add_argument(
+        "--inference_repo",
+        default=None,
+        help="Path to Protenix repo (defaults to the installed/discovered Protenix checkout)",
+    )
     parser.add_argument("--inference_seed", type=int, default=101)
     parser.add_argument("--inference_n_cycle", type=int, default=10)
     parser.add_argument("--inference_n_step", type=int, default=200)
@@ -197,8 +231,15 @@ def main() -> None:
         "score_model_avg_seconds": (score_model_total / len(score_rows)) if score_rows else 0.0,
         "score_timing_csv": str(timing_csv),
     }
+    score_repo = get_loaded_protenix_dir()
+    if score_repo is not None:
+        summary["score_repo"] = str(score_repo.resolve())
 
     if not args.skip_inference and score_rows:
+        score_repo, infer_repo = _resolve_benchmark_repos(args)
+        summary["score_repo"] = str(score_repo)
+        summary["inference_repo"] = str(infer_repo)
+
         combined_json = output_dir / "infer_inputs.json"
         combined_payload = []
         for path in json_paths:
@@ -211,11 +252,7 @@ def main() -> None:
                 combined_payload.append(payload)
         combined_json.write_text(json.dumps(combined_payload, indent=2))
 
-        infer_repo = Path(args.inference_repo) if args.inference_repo else Path(__file__).resolve().parents[1] / "Protenix"
         infer_script = infer_repo / "runner" / "inference.py"
-        if not infer_script.exists():
-            raise FileNotFoundError(f"inference.py not found at {infer_script}")
-
         infer_log = output_dir / "infer.log"
         cmd = [
             "python",
