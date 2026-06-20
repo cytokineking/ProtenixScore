@@ -8,9 +8,7 @@ USE_EXISTING_ENV=0
 NO_CONDA=0
 FORK_URL="https://github.com/cytokineking/Protenix"
 FORK_BRANCH="main"
-# Pin the Protenix fork to a specific commit for reproducible installs.
-# Override with --commit <sha> (or pass an empty string to follow --branch).
-FORK_COMMIT="8c93234e0b53cc1ceeecb3fb8cd9d58fb7803d78"
+FORK_COMMIT=""
 PROTENIX_DIR="${SCRIPT_DIR}/Protenix_fork"
 PROTENIXSCORE_DIR="${SCRIPT_DIR}"
 CHECKPOINT_DIR=""
@@ -30,7 +28,7 @@ Options:
   --no-conda                  Use current Python env (no conda)
   --fork URL                  Protenix fork URL (default: ${FORK_URL})
   --branch NAME               Protenix fork branch (default: ${FORK_BRANCH})
-  --commit SHA                Protenix fork commit to checkout (default: ${FORK_COMMIT})
+  --commit SHA                Optional Protenix fork commit to checkout (default: follow --branch)
   --protenix-dir PATH         Clone/install Protenix here (default: ${PROTENIX_DIR})
   --protenixscore-dir PATH    ProtenixScore dir (default: ${PROTENIXSCORE_DIR})
   --checkpoint-dir PATH       Checkpoint dir (default: <protenix-dir>/release_data/checkpoint)
@@ -155,7 +153,7 @@ if [[ -d "${PROTENIX_DIR}" ]]; then
     git -C "${PROTENIX_DIR}" remote set-url origin "${FORK_URL}"
     git -C "${PROTENIX_DIR}" fetch origin
     if [[ -n "${FORK_COMMIT}" ]]; then
-      echo "Checking out pinned Protenix commit: ${FORK_COMMIT}"
+      echo "Checking out Protenix commit: ${FORK_COMMIT}"
       # Detached HEAD is expected when pinning.
       git -C "${PROTENIX_DIR}" checkout --detach "${FORK_COMMIT}"
     else
@@ -170,7 +168,7 @@ else
   echo "Cloning Protenix fork: ${FORK_URL} (branch ${FORK_BRANCH})"
   git clone --branch "${FORK_BRANCH}" "${FORK_URL}" "${PROTENIX_DIR}"
   if [[ -n "${FORK_COMMIT}" ]]; then
-    echo "Checking out pinned Protenix commit: ${FORK_COMMIT}"
+    echo "Checking out Protenix commit: ${FORK_COMMIT}"
     git -C "${PROTENIX_DIR}" checkout --detach "${FORK_COMMIT}"
   fi
 fi
@@ -194,7 +192,7 @@ PY
 fi
 
 if [[ ${should_install_protenix} -eq 1 ]]; then
-  echo "Installing Protenix (this will enforce pinned torch==2.7.1 per requirements.txt)"
+  echo "Installing Protenix dependencies from requirements.txt"
   cd "${PROTENIX_DIR}"
   if [[ ${CPU_MODE} -eq 1 ]]; then
     python setup.py develop --cpu

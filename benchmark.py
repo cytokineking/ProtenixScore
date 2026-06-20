@@ -12,12 +12,16 @@ from protenixscore.cli import _str2bool
 from protenixscore.score import (
     _configure_device,
     _load_msa_map_index,
+    _load_template_map_index,
     _load_runner,
     _parse_chain_sequence_overrides,
     _sanitize_name,
     _validate_msa_args,
     _validate_msa_preflight,
+    _validate_template_args,
+    _validate_template_preflight,
     _write_msa_resolution_summary,
+    _write_template_resolution_summary,
     collect_input_files,
     _score_single,
 )
@@ -90,8 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recursive", action="store_true", help="Recurse into subdirectories")
     parser.add_argument("--glob", default="*.pdb,*.cif", help="Comma-separated glob patterns")
 
-    parser.add_argument("--use_msas", default="both", choices=["both", "target", "binder", "false"])
+    parser.add_argument("--use_msas", default="false", choices=["both", "target", "binder", "false"])
     parser.add_argument("--use_esm", type=_str2bool, default=False)
+    parser.add_argument("--use_template", default="true", choices=["auto", "true", "false"])
+    parser.add_argument("--template_map_csv", default=None)
+    parser.add_argument("--template_missing_policy", default="ignore", choices=["ignore", "error"])
     parser.add_argument("--msa_map_csv", default=None)
     parser.add_argument("--target_msa_shared_dir", default=None)
     parser.add_argument("--binder_msa_shared_dir", default=None)
@@ -171,6 +178,9 @@ def main() -> None:
     chain_sequence_overrides = _parse_chain_sequence_overrides(args.chain_sequence)
     map_index = _load_msa_map_index(args.msa_map_csv)
     args._msa_map_index = map_index
+    template_map_index = _load_template_map_index(args.template_map_csv)
+    args._template_map_index = template_map_index
+    _validate_template_args(args, template_map_index)
     if args.validate_msa_inputs:
         _validate_msa_preflight(
             args=args,
@@ -179,6 +189,7 @@ def main() -> None:
             inter_dir=inter_dir,
             chain_sequence_overrides=chain_sequence_overrides,
         )
+        _validate_template_preflight(args=args, map_index=template_map_index)
 
     _configure_device(args.device)
     runner = _load_runner(args)
@@ -220,6 +231,7 @@ def main() -> None:
                 f.write(",".join(str(row.get(col, "")) for col in header) + "\n")
 
     _write_msa_resolution_summary(score_dir, score_results)
+    _write_template_resolution_summary(score_dir, score_results)
 
     score_total = sum(r.get("total_seconds") or 0.0 for r in score_rows)
     score_model_total = sum(r.get("model_seconds") or 0.0 for r in score_rows)
@@ -275,6 +287,8 @@ def main() -> None:
             args.triangle_attention,
             "--triangle_multiplicative",
             args.triangle_multiplicative,
+            "--use_template",
+            str(bool(getattr(args, "use_template", False))).lower(),
         ]
 
         env = os.environ.copy()

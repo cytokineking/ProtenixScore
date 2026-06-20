@@ -1,0 +1,4 @@
+sample_id,chain_id,role,template_path,template_chain_id
+complex_0001,A,target,/abs/path/to/templates/target_template.cif,A
+complex_0001,H,binder,/abs/path/to/templates/binder_framework.cif,A
+complex_0001,L,binder,/abs/path/to/templates/light_chain_framework.cif,A

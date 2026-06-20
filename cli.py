@@ -64,11 +64,24 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--score_only", action="store_true", default=True, help="Score-only mode (always on)")
     score.add_argument(
         "--use_msas",
-        default="both",
+        default="false",
         choices=["both", "target", "binder", "false"],
-        help="Real-MSA usage mode by role (default: both).",
+        help="Real-MSA usage mode by role (default: false).",
     )
     score.add_argument("--use_esm", action="store_true", default=False, help="Enable ESM embeddings")
+    score.add_argument(
+        "--use_template",
+        default="true",
+        choices=["auto", "true", "false"],
+        help="Use structural templates when available (auto|true|false; default: true).",
+    )
+    score.add_argument("--template_map_csv", default=None, help="CSV map for structural templates.")
+    score.add_argument(
+        "--template_missing_policy",
+        default="ignore",
+        choices=["ignore", "error"],
+        help="Behavior when template-enabled chains have no matching template (default: ignore).",
+    )
     score.add_argument("--msa_map_csv", default=None, help="CSV map for provided MSAs.")
     score.add_argument("--target_msa_shared_dir", default=None, help="Shared MSA dir for all target chains.")
     score.add_argument("--binder_msa_shared_dir", default=None, help="Shared MSA dir for all binder chains.")
@@ -215,10 +228,12 @@ def _interactive_args() -> argparse.Namespace:
         "Checkpoint dir (optional)",
         DEFAULT_CHECKPOINT_DIR or "",
     )
-    use_msas = _prompt("use_msas (both|target|binder|false)", "both")
+    use_msas = _prompt("use_msas (both|target|binder|false)", "false")
     use_esm = _prompt_bool("Use ESM", False)
+    use_template = _prompt("use_template (auto|true|false)", "true")
     dtype = _prompt("dtype (fp32|bf16|fp16)", "bf16")
     device = _prompt("device (cpu|cuda:N|auto)", "auto")
+    template_map_csv = _prompt("Template map CSV (optional)", "")
     msa_map_csv = _prompt("MSA map CSV (optional)", "")
     target_msa_shared_dir = _prompt("Shared target MSA dir (optional)", "")
     binder_msa_shared_dir = _prompt("Shared binder MSA dir (optional)", "")
@@ -232,6 +247,9 @@ def _interactive_args() -> argparse.Namespace:
         score_only=True,
         use_msas=use_msas,
         use_esm=use_esm,
+        use_template=use_template,
+        template_map_csv=template_map_csv or None,
+        template_missing_policy="ignore",
         msa_map_csv=msa_map_csv or None,
         target_msa_shared_dir=target_msa_shared_dir or None,
         binder_msa_shared_dir=binder_msa_shared_dir or None,

@@ -39,6 +39,7 @@ class ScoreResult:
     full_data: Optional[dict]
     output_dir: Path
     msa_resolution: Optional[List[dict]] = None
+    template_resolution: Optional[List[dict]] = None
     prep_seconds: Optional[float] = None
     model_seconds: Optional[float] = None
     total_seconds: Optional[float] = None
@@ -62,6 +63,25 @@ class MSAMapIndex:
     role_sequence: Dict[Tuple[str, str], MSAMapEntry]
     sequence_only: Dict[str, MSAMapEntry]
     entries: List[MSAMapEntry]
+
+
+@dataclass(frozen=True)
+class TemplateMapEntry:
+    row_number: int
+    sample_id: Optional[str]
+    chain_id: Optional[str]
+    role: Optional[str]
+    sequence_norm: Optional[str]
+    template_path: Path
+    template_chain_id: Optional[str]
+
+
+@dataclass
+class TemplateMapIndex:
+    sample_chain: Dict[Tuple[str, str], List[TemplateMapEntry]]
+    role_sequence: Dict[Tuple[str, str], List[TemplateMapEntry]]
+    sequence_only: Dict[str, List[TemplateMapEntry]]
+    entries: List[TemplateMapEntry]
 
 
 def _ensure_dir(path: Path) -> None:
@@ -463,6 +483,113 @@ def _load_msa_map_index(msa_map_csv: Optional[str]) -> MSAMapIndex:
     )
 
 
+def _empty_template_map_index() -> TemplateMapIndex:
+    return TemplateMapIndex(sample_chain={}, role_sequence={}, sequence_only={}, entries=[])
+
+
+def _append_template_index(
+    index: Dict,
+    key,
+    entry: TemplateMapEntry,
+) -> None:
+    index.setdefault(key, []).append(entry)
+
+
+def _supported_template_suffix(path: Path) -> bool:
+    return path.suffix.lower() in {".pdb", ".cif", ".mmcif"}
+
+
+def _load_template_map_index(template_map_csv: Optional[str]) -> TemplateMapIndex:
+    if not template_map_csv:
+        return _empty_template_map_index()
+
+    path = Path(template_map_csv)
+    if not path.exists():
+        raise FileNotFoundError(f"--template_map_csv file not found: {path}")
+
+    sample_chain: Dict[Tuple[str, str], List[TemplateMapEntry]] = {}
+    role_sequence: Dict[Tuple[str, str], List[TemplateMapEntry]] = {}
+    sequence_only: Dict[str, List[TemplateMapEntry]] = {}
+    entries: List[TemplateMapEntry] = []
+
+    with open(path, "r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"--template_map_csv has no header row: {path}")
+        for row_number, row in enumerate(reader, start=2):
+            sample_raw = _read_csv_row_value(row, "sample_id") or _read_csv_row_value(row, "sample")
+            sample_id = _sanitize_name(sample_raw) if sample_raw else None
+            chain_id = _read_csv_row_value(row, "chain_id") or None
+
+            role_raw = _read_csv_row_value(row, "role").lower()
+            role: Optional[str] = role_raw or None
+            if role is not None and role not in {"target", "binder"}:
+                raise ValueError(
+                    f"--template_map_csv row {row_number}: role must be target or binder, got {role_raw!r}"
+                )
+
+            seq_raw = _read_csv_row_value(row, "sequence")
+            sequence_norm = _normalize_sequence(seq_raw) if seq_raw else None
+
+            has_sample_chain = bool(sample_id and chain_id)
+            has_sequence = bool(sequence_norm)
+            if not (has_sample_chain or has_sequence):
+                raise ValueError(
+                    f"--template_map_csv row {row_number}: provide sample_id+chain_id and/or sequence"
+                )
+
+            path_values = [
+                ("template_path", _read_csv_row_value(row, "template_path")),
+                ("path", _read_csv_row_value(row, "path")),
+                ("cif", _read_csv_row_value(row, "cif")),
+                ("pdb", _read_csv_row_value(row, "pdb")),
+            ]
+            present_paths = [(field, value) for field, value in path_values if value]
+            if len(present_paths) != 1:
+                raise ValueError(
+                    f"--template_map_csv row {row_number}: provide exactly one template path "
+                    "via template_path, path, cif, or pdb"
+                )
+            template_path = _resolve_csv_path(present_paths[0][1], path)
+            if not _supported_template_suffix(template_path):
+                raise ValueError(
+                    f"--template_map_csv row {row_number}: unsupported template suffix "
+                    f"{template_path.suffix!r}; expected .pdb, .cif, or .mmcif"
+                )
+
+            template_chain_id = (
+                _read_csv_row_value(row, "template_chain_id")
+                or _read_csv_row_value(row, "template_id")
+                or _read_csv_row_value(row, "templateChainId")
+                or None
+            )
+
+            entry = TemplateMapEntry(
+                row_number=row_number,
+                sample_id=sample_id,
+                chain_id=chain_id,
+                role=role,
+                sequence_norm=sequence_norm,
+                template_path=template_path,
+                template_chain_id=template_chain_id,
+            )
+            entries.append(entry)
+
+            if has_sample_chain:
+                _append_template_index(sample_chain, (sample_id, chain_id), entry)
+            if has_sequence and role is not None:
+                _append_template_index(role_sequence, (role, sequence_norm), entry)
+            if has_sequence and role is None:
+                _append_template_index(sequence_only, sequence_norm, entry)
+
+    return TemplateMapIndex(
+        sample_chain=sample_chain,
+        role_sequence=role_sequence,
+        sequence_only=sequence_only,
+        entries=entries,
+    )
+
+
 def _resolve_map_entry(
     map_index: MSAMapIndex,
     *,
@@ -486,6 +613,31 @@ def _resolve_map_entry(
             return map_index.sequence_only[sequence_norm], "sequence"
 
     return None, None
+
+
+def _resolve_template_entries(
+    map_index: TemplateMapIndex,
+    *,
+    sample_id: str,
+    chain_id: str,
+    role: str,
+    sequence_norm: str,
+) -> Tuple[List[TemplateMapEntry], Optional[str]]:
+    if not map_index.entries:
+        return [], None
+
+    sample_key = (sample_id, chain_id)
+    if sample_key in map_index.sample_chain:
+        return map_index.sample_chain[sample_key], "sample_chain"
+
+    if sequence_norm:
+        role_key = (role, sequence_norm)
+        if role_key in map_index.role_sequence:
+            return map_index.role_sequence[role_key], "role_sequence"
+        if sequence_norm in map_index.sequence_only:
+            return map_index.sequence_only[sequence_norm], "sequence"
+
+    return [], None
 
 
 def _remove_tree(path: Path) -> None:
@@ -851,6 +1003,118 @@ def _apply_msa_resolution(
     return resolution_records
 
 
+def _protein_chain_ids(protein: dict, fallback: str) -> List[str]:
+    raw_ids = protein.get("id") or protein.get("label_asym_id") or []
+    if isinstance(raw_ids, str):
+        ids = [raw_ids]
+    else:
+        ids = [str(item) for item in raw_ids if str(item)]
+    return ids or [fallback]
+
+
+def _ensure_explicit_protein_chain_ids(json_dict: dict) -> None:
+    for protein in _iter_protein_entries(json_dict):
+        if protein.get("id"):
+            continue
+        label_asym_ids = protein.get("label_asym_id") or []
+        if isinstance(label_asym_ids, str):
+            ids = [label_asym_ids]
+        else:
+            ids = [str(item) for item in label_asym_ids if str(item)]
+        if ids:
+            protein["id"] = ids
+
+
+def _template_payload(entry: TemplateMapEntry, chain_id: str) -> dict:
+    payload_key = "pdb" if entry.template_path.suffix.lower() == ".pdb" else "cif"
+    payload = {
+        payload_key: str(entry.template_path),
+        "chain_id": [str(chain_id)],
+    }
+    if entry.template_chain_id:
+        payload["template_id"] = [str(entry.template_chain_id)]
+    return payload
+
+
+def _apply_template_resolution(
+    *,
+    json_dict: dict,
+    sample_name: str,
+    args,
+    map_index: TemplateMapIndex,
+) -> List[dict]:
+    if not getattr(args, "use_template", False):
+        return []
+    if not map_index.entries:
+        return []
+
+    _ensure_explicit_protein_chain_ids(json_dict)
+
+    target_chain_ids = set(_parse_chain_list(args.target_chains))
+    target_sequences = {_normalize_sequence(seq) for seq in _load_fasta_sequences(args.target_chain_sequences)}
+    missing_policy = getattr(args, "template_missing_policy", "ignore")
+
+    samples = json_dict if isinstance(json_dict, list) else [json_dict]
+    resolution_records: List[dict] = []
+    unresolved: List[str] = []
+
+    for sample in samples:
+        templates = list(sample.get("templates") or [])
+        chain_counter = 0
+        for protein in _iter_protein_entries(sample):
+            chain_counter += 1
+            chain_ids = _protein_chain_ids(protein, fallback=f"chain_{chain_counter}")
+            sequence_raw = str(protein.get("sequence", "") or "")
+            sequence_norm = _normalize_sequence(sequence_raw)
+
+            for chain_id in chain_ids:
+                role = _role_for_chain(
+                    chain_id=chain_id,
+                    sequence_norm=sequence_norm,
+                    target_chain_ids=target_chain_ids,
+                    target_sequences=target_sequences,
+                )
+                entries, match_strategy = _resolve_template_entries(
+                    map_index,
+                    sample_id=sample_name,
+                    chain_id=chain_id,
+                    role=role,
+                    sequence_norm=sequence_norm,
+                )
+                if not entries:
+                    if missing_policy == "error":
+                        unresolved.append(f"{sample_name}:{chain_id}:{role}")
+                    continue
+
+                for entry in entries:
+                    templates.append(_template_payload(entry, chain_id))
+                    resolution_records.append(
+                        {
+                            "chain_id": chain_id,
+                            "role": role,
+                            "sequence_sha": _hash_sequence(sequence_norm),
+                            "source": "map",
+                            "template_path": str(entry.template_path),
+                            "template_chain_id": entry.template_chain_id,
+                            "match_strategy": match_strategy,
+                            "row_number": entry.row_number,
+                        }
+                    )
+
+        if templates:
+            sample["templates"] = templates
+
+    if unresolved:
+        preview = ", ".join(unresolved[:10])
+        suffix = "" if len(unresolved) <= 10 else f" ... (+{len(unresolved) - 10} more)"
+        raise FileNotFoundError(
+            "--template_missing_policy=error requires template coverage for every protein chain. "
+            f"Unresolved chains: {preview}{suffix}"
+        )
+
+    return resolution_records
+
+
 def _map_entry_msa_dir_ready(entry: MSAMapEntry) -> bool:
     if entry.msa_dir is not None:
         return (entry.msa_dir / "non_pairing.a3m").exists()
@@ -860,6 +1124,8 @@ def _map_entry_msa_dir_ready(entry: MSAMapEntry) -> bool:
 
 
 def _validate_msa_args(args) -> None:
+    if not hasattr(args, "use_msas"):
+        args.use_msas = "false"
     if args.use_msas not in {"both", "target", "binder", "false"}:
         raise ValueError(f"Invalid --use_msas value: {args.use_msas}")
     if args.msa_provider not in {"mmseqs2", "none"}:
@@ -876,6 +1142,55 @@ def _validate_msa_args(args) -> None:
         args.msa_cache_dir = os.path.join(args.output, "msa_cache")
 
     args.use_msa = True
+
+
+def _template_mode_to_bool(value, has_template_map: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    val = str(value or "auto").strip().lower()
+    if val == "auto":
+        return has_template_map
+    if val in {"y", "yes", "true", "1"}:
+        return True
+    if val in {"n", "no", "false", "0"}:
+        return False
+    raise ValueError(f"Invalid --use_template value: {value}")
+
+
+def _validate_template_args(args, template_map_index: TemplateMapIndex) -> None:
+    args.use_template = _template_mode_to_bool(
+        getattr(args, "use_template", "true"),
+        has_template_map=bool(template_map_index.entries),
+    )
+
+    if not hasattr(args, "template_missing_policy"):
+        args.template_missing_policy = "ignore"
+    if args.template_missing_policy not in {"ignore", "error"}:
+        raise ValueError(f"Invalid --template_missing_policy value: {args.template_missing_policy}")
+
+    if template_map_index.entries and not args.use_template:
+        logger.warning("--template_map_csv was provided but --use_template=false; templates will be ignored")
+    if args.use_template and not template_map_index.entries:
+        logger.warning("--use_template=true but no --template_map_csv entries were provided")
+
+
+def _validate_template_preflight(
+    *,
+    args,
+    map_index: TemplateMapIndex,
+) -> None:
+    if not getattr(args, "use_template", False):
+        return
+    for entry in map_index.entries:
+        if not entry.template_path.exists():
+            raise FileNotFoundError(
+                f"--template_map_csv row {entry.row_number}: template file not found: {entry.template_path}"
+            )
+        if not _supported_template_suffix(entry.template_path):
+            raise ValueError(
+                f"--template_map_csv row {entry.row_number}: unsupported template suffix "
+                f"{entry.template_path.suffix!r}; expected .pdb, .cif, or .mmcif"
+            )
 
 
 def _collect_chain_role_records_for_preflight(
@@ -1030,6 +1345,11 @@ def _write_msa_resolution(sample_out_dir: Path, records: List[dict]) -> None:
         json.dump(records, handle, indent=2)
 
 
+def _write_template_resolution(sample_out_dir: Path, records: List[dict]) -> None:
+    with open(sample_out_dir / "template_resolution.json", "w") as handle:
+        json.dump(records, handle, indent=2)
+
+
 def _write_msa_resolution_summary(output_dir: Path, results: List[ScoreResult]) -> None:
     summary = {
         "total_chains": 0,
@@ -1059,6 +1379,33 @@ def _write_msa_resolution_summary(output_dir: Path, results: List[ScoreResult]) 
                 summary["single_policy_fallbacks"] += 1
 
     with open(output_dir / "msa_resolution_summary.json", "w") as handle:
+        json.dump(summary, handle, indent=2)
+
+
+def _write_template_resolution_summary(output_dir: Path, results: List[ScoreResult]) -> None:
+    summary = {
+        "total_templates": 0,
+        "chains_by_role": {"target": 0, "binder": 0},
+        "match_strategy_counts": {},
+        "template_paths": {},
+    }
+    for result in results:
+        for rec in getattr(result, "template_resolution", None) or []:
+            summary["total_templates"] += 1
+            role = rec.get("role")
+            if role in summary["chains_by_role"]:
+                summary["chains_by_role"][role] += 1
+            strategy = str(rec.get("match_strategy") or "unknown")
+            summary["match_strategy_counts"][strategy] = (
+                summary["match_strategy_counts"].get(strategy, 0) + 1
+            )
+            template_path = str(rec.get("template_path") or "")
+            if template_path:
+                summary["template_paths"][template_path] = (
+                    summary["template_paths"].get(template_path, 0) + 1
+                )
+
+    with open(output_dir / "template_resolution_summary.json", "w") as handle:
         json.dump(summary, handle, indent=2)
 
 
@@ -1170,6 +1517,7 @@ def _load_runner(args) -> object:
         dtype=args.dtype,
         model_name=args.model_name,
         use_msa=args.use_msa,
+        use_template=bool(getattr(args, "use_template", False)),
         trimul_kernel="torch",
         triatt_kernel="torch",
     )
@@ -1177,6 +1525,7 @@ def _load_runner(args) -> object:
         runner.configs.load_checkpoint_dir = args.checkpoint_dir
         runner.load_checkpoint()
     runner.configs.use_msa = args.use_msa
+    runner.configs.use_template = bool(getattr(args, "use_template", False))
     runner.configs.num_workers = args.num_workers
     if hasattr(runner.configs, "esm"):
         runner.configs.esm.enable = bool(args.use_esm)
@@ -1449,6 +1798,14 @@ def _score_single(
         map_index=map_index,
     )
     _write_msa_resolution(sample_out_dir, msa_resolution)
+    template_map_index = getattr(args, "_template_map_index", _empty_template_map_index())
+    template_resolution = _apply_template_resolution(
+        json_dict=json_dict,
+        sample_name=sample_name,
+        args=args,
+        map_index=template_map_index,
+    )
+    _write_template_resolution(sample_out_dir, template_resolution)
     with open(json_path, "w") as f:
         json.dump(json_dict, f, indent=2)
 
@@ -1458,6 +1815,7 @@ def _score_single(
     runner.configs.input_json_path = str(json_path)
     runner.configs.dump_dir = str(output_dir)
     runner.configs.use_msa = args.use_msa
+    runner.configs.use_template = bool(getattr(args, "use_template", False))
     dataset = InferenceDataset(runner.configs)
 
     if len(dataset.inputs) != 1:
@@ -1580,6 +1938,7 @@ def _score_single(
         full_data=full_data,
         output_dir=sample_out_dir,
         msa_resolution=msa_resolution,
+        template_resolution=template_resolution,
         prep_seconds=prep_seconds,
         model_seconds=model_seconds,
         total_seconds=total_seconds,
@@ -1635,6 +1994,9 @@ def run_score(args) -> None:
         )
         map_index = _load_msa_map_index(getattr(args, "msa_map_csv", None))
         args._msa_map_index = map_index
+        template_map_index = _load_template_map_index(getattr(args, "template_map_csv", None))
+        args._template_map_index = template_map_index
+        _validate_template_args(args, template_map_index)
 
         if args.msa_cache_mode != "none" and args.msa_cache_dir:
             _ensure_dir(Path(args.msa_cache_dir))
@@ -1647,6 +2009,7 @@ def run_score(args) -> None:
                 inter_dir=inter_dir,
                 chain_sequence_overrides=chain_sequence_overrides,
             )
+            _validate_template_preflight(args=args, map_index=template_map_index)
 
         logger.info(
             "MSA config: use_msas=%s provider=%s cache_mode=%s cache_dir=%s map_csv=%s "
@@ -1660,6 +2023,13 @@ def run_score(args) -> None:
             args.binder_msa_shared_dir,
             args.msa_missing_policy,
             args.validate_msa_inputs,
+        )
+        logger.info(
+            "Template config: use_template=%s map_csv=%s missing_policy=%s entries=%d",
+            args.use_template,
+            getattr(args, "template_map_csv", None),
+            args.template_missing_policy,
+            len(template_map_index.entries),
         )
 
         runner = _load_runner(args)
@@ -1692,6 +2062,7 @@ def run_score(args) -> None:
 
         _write_aggregate_csv(results, Path(args.aggregate_csv))
         _write_msa_resolution_summary(output_dir, results)
+        _write_template_resolution_summary(output_dir, results)
     finally:
         if temp_dir is not None:
             temp_dir.cleanup()
